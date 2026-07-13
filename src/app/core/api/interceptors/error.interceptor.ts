@@ -41,15 +41,29 @@ function toApiError(res: HttpErrorResponse): ApiError {
 
   const body = res.error;
   if (body && typeof body === 'object' && !(body instanceof ProgressEvent)) {
-    const b = body as ApiErrorResponseBody & { notifications?: string[] };
-    if (Array.isArray(b.notifications) && b.notifications.length > 0) {
-      const fromNotifications = b.notifications.filter((n): n is string => typeof n === 'string').join(' ').trim();
+    const b = body as ApiErrorResponseBody & { notifications?: string[] | string; Notifications?: string[] | string };
+    const nRaw = b.notifications ?? b.Notifications;
+    if (Array.isArray(nRaw) && nRaw.length > 0) {
+      const fromNotifications = nRaw.filter((n): n is string => typeof n === 'string').join(' ').trim();
       if (fromNotifications) message = fromNotifications;
+    } else if (typeof nRaw === 'string' && nRaw.trim()) {
+      message = nRaw.trim();
     } else {
-      const msg = b.message ?? b.title;
+      const msg = b.message ?? b.title ?? (b as { Message?: string }).Message ?? (b as { Title?: string }).Title;
       if (typeof msg === 'string' && msg.trim()) message = msg.trim();
     }
     if (b.errors) fieldErrors = parseFieldErrors(b.errors as Record<string, string[]> | string[]);
+    if (fieldErrors && Object.keys(fieldErrors).length > 0) {
+      const flat = Object.values(fieldErrors)
+        .flat()
+        .filter((x): x is string => typeof x === 'string' && x.trim().length > 0);
+      const generic =
+        message === DEFAULT_MESSAGES[status] ||
+        /validation error|requisição inválida|one or more validation/i.test(message);
+      if (flat.length > 0 && generic) {
+        message = flat.join(' ');
+      }
+    }
   } else if (typeof body === 'string' && body.trim()) {
     message = body.trim();
   }
@@ -59,12 +73,29 @@ function toApiError(res: HttpErrorResponse): ApiError {
 
 /** Endpoint de login: toast é exibido pela própria tela de login com mensagem da API. */
 function isLoginRequest(req: HttpRequest<unknown>): boolean {
-  return req.url.includes('auth/Usuario/Login');
+  return req.url.toLowerCase().includes('auth/usuario/login');
 }
 
 /** Consulta CNPJ (BrasilAPI direta): mensagem de erro é exibida no próprio campo do formulário. */
 function isBrasilApiCnpjRequest(req: HttpRequest<unknown>): boolean {
   return req.url.includes('brasilapi.com.br');
+}
+
+/** Confirmação de e-mail: feedback na própria página. */
+function isConfirmarEmailRequest(req: HttpRequest<unknown>): boolean {
+  return req.url.toLowerCase().includes('auth/usuario/confirmar-email');
+}
+
+/** Esqueci / redefinir senha: mensagens na própria página (evita toast duplicado). */
+function isPasswordResetPublicRequest(req: HttpRequest<unknown>): boolean {
+  const u = req.url.toLowerCase();
+  return u.includes('auth/usuario/esqueci-senha') || u.includes('auth/usuario/redefinir-senha');
+}
+
+/** Cadastro de usuário: a tela (modal) exibe a mensagem; evita toast duplicado. */
+function isUsuarioRegisterRequest(req: HttpRequest<unknown>): boolean {
+  const u = req.url.toLowerCase();
+  return u.includes('auth/usuario/register') || u.includes('auth/usuario/registrar');
 }
 
 /**
@@ -80,7 +111,13 @@ export function errorInterceptor(req: HttpRequest<unknown>, next: HttpHandlerFn)
         status: undefined,
         fieldErrors: undefined
       };
-      if (!isLoginRequest(req) && !isBrasilApiCnpjRequest(req)) {
+      if (
+        !isLoginRequest(req) &&
+        !isBrasilApiCnpjRequest(req) &&
+        !isConfirmarEmailRequest(req) &&
+        !isPasswordResetPublicRequest(req) &&
+        !isUsuarioRegisterRequest(req)
+      ) {
         toast.error(apiError.message);
       }
       return throwError(() => apiError);

@@ -1,6 +1,5 @@
 import { Routes } from '@angular/router';
 import { GerenciamentoLayoutComponent } from './gerenciamento-layout/gerenciamento-layout.component';
-import { GerenciamentoPageComponent } from './pages/gerenciamento-page/gerenciamento-page.component';
 import { permissionGuard } from '../../core/guards/permission.guard';
 
 export const GERENCIAMENTO_ROUTES: Routes = [
@@ -8,7 +7,11 @@ export const GERENCIAMENTO_ROUTES: Routes = [
     path: '',
     component: GerenciamentoLayoutComponent,
     children: [
-      { path: '', pathMatch: 'full', component: GerenciamentoPageComponent },
+      {
+        path: '',
+        pathMatch: 'full',
+        redirectTo: 'menu',
+      },
       { path: 'permissoes', redirectTo: 'menu', pathMatch: 'full' },
       { path: 'admin', redirectTo: 'menu', pathMatch: 'full' },
       {
@@ -26,6 +29,26 @@ export const GERENCIAMENTO_ROUTES: Routes = [
           import('../cadastro/pages/acessos-perfis-page/acessos-perfis-page.component').then(
             (m) => m.AcessosPerfisPageComponent
           ),
+      },
+      /**
+       * Lista + toolbar iguais a `/app/cadastro/estacionamento` (layout compartilhado).
+       * Novo/Editar continuam nas rotas canônicas em `/app/cadastro/estacionamento/...`.
+       */
+      {
+        path: 'estacionamento',
+        loadComponent: () =>
+          import('../cadastro/estacionamento-layout.component').then(
+            (m) => m.EstacionamentoLayoutComponent
+          ),
+        children: [
+          {
+            path: '',
+            loadComponent: () =>
+              import('../cadastro/pages/estacionamento-list/estacionamento-list.component').then(
+                (m) => m.EstacionamentoListComponent
+              ),
+          },
+        ],
       },
     ],
   },

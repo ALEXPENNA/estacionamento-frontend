@@ -1,5 +1,5 @@
 import { Injectable, computed, inject, signal } from '@angular/core';
-import { CdkDragDrop, moveItemInArray } from '@angular/cdk/drag-drop';
+import { CdkDragDrop, moveItemInArray, transferArrayItem } from '@angular/cdk/drag-drop';
 import {
   MenuAdmin,
   MenuAdminState,
@@ -15,7 +15,11 @@ import {
 } from './menu-permission-acao';
 import { MENU_STRUCTURE } from '../../cadastro/constants/menu-structure';
 import { resolveAppRouteFromNome, resolveMaterialSymbolIconFromModule } from './menu-route-resolver';
-import { SessionAccessService } from '../../../core/services/session-access.service';
+import {
+  SessionAccessService,
+  type SessionMenuAccess,
+  type SessionSubMenuAccess,
+} from '../../../core/services/session-access.service';
 
 const STORAGE_KEY = 'gts-menu-admin-state-v1';
 
@@ -41,16 +45,17 @@ function buildSeedState(): MenuAdminState {
     const menuId = nid++;
     const subs: SubMenuAdmin[] = [];
     if (node.children?.length) {
-      node.children.forEach((c, si) => {
+      let ordem = 0;
+      for (const c of node.children) {
         subs.push({
           id: nid++,
           nome: c.label,
-          ordem: si,
+          ordem: ordem++,
           rota: c.route,
           ativo: true,
           permissions: [],
         });
-      });
+      }
     } else {
       subs.push({
         id: nid++,
@@ -66,6 +71,7 @@ function buildSeedState(): MenuAdminState {
       nome: node.label,
       ordem: mi,
       icone: node.icon,
+      rota: node.route,
       ativo: true,
       subMenus: subs,
       existeNoServidor: false,
@@ -90,7 +96,7 @@ export class MenuAdminService {
   readonly menus = computed(() => this.state().menus);
   readonly roles = computed(() => this.state().roles);
 
-  /** Menu dinâmico para a sidebar (atualiza quando o estado muda). Gerenciamento entra sem submenus (link único). */
+  /** Menu dinâmico para a sidebar (atualiza quando o estado muda). */
   readonly sidebarMenuItems = computed(() => this.getSidebarMenuItems());
 
   private loadInitial(): MenuAdminState {
@@ -99,9 +105,9 @@ export class MenuAdminService {
       if (raw) {
         const parsed = JSON.parse(raw) as MenuAdminState;
         if (parsed?.menus?.length) {
-        migrateMenuServidorFlagsFromStorage(parsed.menus);
-        return parsed;
-      }
+          migrateMenuServidorFlagsFromStorage(parsed.menus);
+          return parsed;
+        }
       }
     } catch {
       /* ignore */
@@ -140,6 +146,63 @@ export class MenuAdminService {
       return next;
     });
     this.persist();
+    this.syncSessionMenusWithCurrentTree(menus);
+  }
+
+  /**
+   * Reaplica a árvore de menus atual no estado de sessão do usuário, preservando o que já estava selecionado
+   * por id (menu/submenu). Isso mantém o sidebar coerente após mover submenu entre menus no admin.
+   */
+  private syncSessionMenusWithCurrentTree(latestMenus: MenuAdmin[]): void {
+    if (!this.sessionAccess.hasSessionMenus()) return;
+
+    const previous = this.sessionAccess.menus();
+    const selectedMenuIds = new Set<number>();
+    const selectedSubMenuIds = new Set<number>();
+
+    for (const menu of previous) {
+      if (menu.id != null && menu.selecionado !== false) {
+        selectedMenuIds.add(menu.id);
+      }
+      for (const sub of menu.subMenus ?? []) {
+        if (sub.id != null && sub.selecionado !== false) {
+          selectedSubMenuIds.add(sub.id);
+        }
+      }
+    }
+
+    const nextSessionMenus: SessionMenuAccess[] = latestMenus
+      .filter((menu) => menu.ativo !== false)
+      .sort((a, b) => a.ordem - b.ordem)
+      .map((menu) => {
+        const subMenus: SessionSubMenuAccess[] = (menu.subMenus ?? [])
+          .filter((sub) => sub.ativo !== false)
+          .sort((a, b) => a.ordem - b.ordem)
+          .map((sub) => ({
+            id: sub.id,
+            descricao: sub.nome,
+            rota: sub.rota,
+            ativo: sub.ativo,
+            selecionado: selectedSubMenuIds.has(sub.id),
+            ordem: sub.ordem,
+          }));
+
+        const menuSelecionado =
+          selectedMenuIds.has(menu.id) || subMenus.some((sub) => sub.selecionado !== false);
+
+        return {
+          id: menu.id,
+          descricao: menu.nome,
+          icone: menu.icone,
+          rota: menu.rota,
+          ativo: menu.ativo,
+          selecionado: menuSelecionado,
+          ordem: menu.ordem,
+          subMenus,
+        };
+      });
+
+    this.sessionAccess.setMenus(nextSessionMenus);
   }
 
   exportJson(): string {
@@ -197,7 +260,7 @@ export class MenuAdminService {
 
   updateMenu(
     id: number,
-    patch: Partial<Pick<MenuAdmin, 'nome' | 'icone' | 'ativo'>>
+    patch: Partial<Pick<MenuAdmin, 'nome' | 'icone' | 'ativo' | 'rota'>>
   ): void {
     this.patch((s) => {
       const m = s.menus.find((x) => x.id === id);
@@ -263,13 +326,47 @@ export class MenuAdminService {
     });
   }
 
-  onSubMenuDrop(menuId: number, event: CdkDragDrop<SubMenuAdmin[]>): void {
-    if (event.previousIndex === event.currentIndex) return;
+  /**
+   * Reordena submenus no mesmo menu ou transfere entre menus (Salvar → OrganizarMenus persiste no backend).
+   */
+  onSubMenuDrop(targetMenuId: number, event: CdkDragDrop<SubMenuAdmin[]>): void {
+    if (event.previousContainer === event.container) {
+      if (event.previousIndex === event.currentIndex) return;
+      this.patch((s) => {
+        const menu = s.menus.find((x) => x.id === targetMenuId);
+        if (!menu) return;
+        moveItemInArray(menu.subMenus, event.previousIndex, event.currentIndex);
+        menu.subMenus = menu.subMenus.map((x, i) => ({ ...x, ordem: i }));
+      });
+      return;
+    }
+
     this.patch((s) => {
-      const menu = s.menus.find((x) => x.id === menuId);
-      if (!menu) return;
-      moveItemInArray(menu.subMenus, event.previousIndex, event.currentIndex);
-      menu.subMenus = menu.subMenus.map((x, i) => ({ ...x, ordem: i }));
+      const targetMenu = s.menus.find((x) => x.id === targetMenuId);
+      if (!targetMenu) return;
+
+      let sourceMenu: MenuAdmin | undefined;
+      const prevId = event.previousContainer.id;
+      if (typeof prevId === 'string' && prevId.startsWith('submenu-drop-')) {
+        const parsed = Number(prevId.replace(/^submenu-drop-/, ''));
+        if (!Number.isNaN(parsed)) {
+          sourceMenu = s.menus.find((m) => m.id === parsed);
+        }
+      }
+      if (!sourceMenu) {
+        const prevData = event.previousContainer.data as SubMenuAdmin[];
+        sourceMenu = s.menus.find((m) => m.subMenus === prevData);
+      }
+      if (!sourceMenu || sourceMenu.id === targetMenu.id) return;
+
+      transferArrayItem(
+        sourceMenu.subMenus,
+        targetMenu.subMenus,
+        event.previousIndex,
+        event.currentIndex
+      );
+      sourceMenu.subMenus = sourceMenu.subMenus.map((x, i) => ({ ...x, ordem: i }));
+      targetMenu.subMenus = targetMenu.subMenus.map((x, i) => ({ ...x, ordem: i }));
     });
   }
 
@@ -376,34 +473,97 @@ export class MenuAdminService {
   }
 
   /**
-   * Itens para sidebar. Gerenciamento aparece como um único link (`/app/gerenciamento`), sem submenus na barra lateral
-   * (Acessos/Menu/Perfil continuam na própria área de Gerenciamento).
+   * Itens para sidebar. Gerenciamento: só link único `/app/gerenciamento` (Estacionamento só dentro da área Gerenciamento).
    */
   getSidebarMenuItems(): {
     label: string;
     route: string;
     icon: string;
-    children?: { label: string; route: string }[];
+    children?: { label: string; route: string; children?: { label: string; route: string }[] }[];
   }[] {
     const source = this.sessionAccess.hasSessionMenus()
       ? this.buildNavItemsFromSessionMenus()
       : this.buildNavItemsFromState();
 
-    return source.map((item) => {
-      if (!this.isGerenciamentoNavItem(item)) return item;
-      return {
-        label: item.label,
-        route: '/app/gerenciamento',
-        icon: item.icon,
-      };
-    });
+    return source
+      .map((item) => {
+        const baseItem = {
+          ...item,
+          children: (item.children ?? []).length > 0 ? item.children : undefined,
+        };
+        if (!this.isGerenciamentoNavItem(baseItem)) return baseItem;
+        return {
+          label: item.label,
+          route: '/app/gerenciamento',
+          icon: item.icon,
+        };
+      })
+      .map((item) => this.sanitizeCadastroSidebarNavItem(item));
+  }
+
+  /**
+   * Cadastro na sidebar: remove itens que não devem aparecer (Estacionamento, motorista, veículo) e
+   * padroniza rótulos quando aplicável (ex.: Transportadora).
+   */
+  private sanitizeCadastroSidebarNavItem<
+    T extends {
+      route: string;
+      children?: {
+        label: string;
+        route: string;
+        children?: { label: string; route: string }[];
+      }[];
+    },
+  >(item: T): T {
+    const base = item.route.replace(/\/+$/, '').toLowerCase();
+    if (base !== '/app/cadastro' || !item.children?.length) {
+      return item;
+    }
+
+    const children = item.children
+      .filter((c) => !this.isHiddenCadastroSidebarRoute(c.route))
+      .map((c) => {
+        const mapped = {
+          ...c,
+          label: this.formatCadastroSubmenuSidebarLabel(c.route, c.label),
+        };
+        if (!c.children?.length) return mapped;
+        const nested = c.children
+          .filter((n) => !this.isHiddenCadastroSidebarRoute(n.route))
+          .map((n) => ({
+            ...n,
+            label: this.formatCadastroSubmenuSidebarLabel(n.route, n.label),
+          }));
+        return nested.length ? { ...mapped, children: nested } : { ...mapped, children: undefined };
+      });
+
+    return {
+      ...item,
+      children: children.length ? children : undefined,
+    } as T;
+  }
+
+  /** Estacionamento: só na área Gerenciamento. Motorista/veículo: fora da sidebar em Cadastro. */
+  private isHiddenCadastroSidebarRoute(route: string): boolean {
+    const n = route.replace(/\/+$/, '').toLowerCase();
+    if (n === '/app/cadastro/estacionamento' || n.startsWith('/app/cadastro/estacionamento/')) {
+      return true;
+    }
+    if (n === '/app/cadastro/motorista') return true;
+    return /\/app\/cadastro\/veicul/i.test(n);
+  }
+
+  private formatCadastroSubmenuSidebarLabel(route: string, label: string): string {
+    const path = route.replace(/\/+$/, '').toLowerCase();
+    if (/(?:^|\/)cadastro\/transportadora(?:\/|$)/.test(path)) return 'Transportadora';
+    return label;
   }
 
   private buildNavItemsFromSessionMenus(): {
     label: string;
     route: string;
     icon: string;
-    children?: { label: string; route: string }[];
+    children?: { label: string; route: string; children?: { label: string; route: string }[] }[];
   }[] {
     return this.sessionAccess
       .menus()
@@ -419,7 +579,7 @@ export class MenuAdminService {
         if (activeSubs.length === 0) {
           return {
             label: menuLabel,
-            route: resolveAppRouteFromNome(menuLabel, null),
+            route: resolveAppRouteFromNome(menuLabel, m.rota ?? null),
             icon,
           };
         }
@@ -436,7 +596,11 @@ export class MenuAdminService {
 
         const first = activeSubs[0];
         const firstRoute = resolveAppRouteFromNome(first.descricao?.trim() || menuLabel, first.rota);
-        const base = firstRoute.replace(/\/[^/]*$/, '') || '/app';
+        const rawParent = m.rota?.trim();
+        const base =
+          rawParent && rawParent.startsWith('/app')
+            ? rawParent.replace(/\/+$/, '')
+            : firstRoute.replace(/\/[^/]*$/, '') || '/app';
         return {
           label: menuLabel,
           route: base,
@@ -453,7 +617,7 @@ export class MenuAdminService {
     label: string;
     route: string;
     icon: string;
-    children?: { label: string; route: string }[];
+    children?: { label: string; route: string; children?: { label: string; route: string }[] }[];
   }[] {
     return this.state()
       .menus.filter((m) => m.ativo)
@@ -463,14 +627,14 @@ export class MenuAdminService {
         if (m.subMenus.length > 0 && subs.length === 0) {
           return {
             label: m.nome,
-            route: resolveAppRouteFromNome(m.nome, null),
+            route: resolveAppRouteFromNome(m.nome, m.rota ?? null),
             icon: resolveMaterialSymbolIconFromModule(m.nome, m.icone),
           };
         }
         if (subs.length === 0) {
           return {
             label: m.nome,
-            route: resolveAppRouteFromNome(m.nome, null),
+            route: resolveAppRouteFromNome(m.nome, m.rota ?? null),
             icon: resolveMaterialSymbolIconFromModule(m.nome, m.icone),
           };
         }
@@ -482,7 +646,11 @@ export class MenuAdminService {
           };
         }
         const firstRota = resolveAppRouteFromNome(subs[0].nome, subs[0].rota);
-        const base = firstRota.replace(/\/[^/]*$/, '') || '/app';
+        const rawParent = m.rota?.trim();
+        const base =
+          rawParent && rawParent.startsWith('/app')
+            ? rawParent.replace(/\/+$/, '')
+            : firstRota.replace(/\/[^/]*$/, '') || '/app';
         return {
           label: m.nome,
           route: base,
@@ -496,14 +664,19 @@ export class MenuAdminService {
       .filter((item): item is NonNullable<typeof item> => item !== null);
   }
 
-  /** Identifica o nó de menu cujas rotas são de Gerenciamento (sidebar: item único, sem filhos). */
+  /** Sidebar: Gerenciamento é sempre um único link (sem filhos). */
   private isGerenciamentoNavItem(item: {
     route: string;
-    children?: { route: string }[];
+    children?: { route: string; children?: { route: string }[] }[];
   }): boolean {
     if (item.route.startsWith('/app/gerenciamento')) {
       return true;
     }
-    return item.children?.some((c) => c.route.startsWith('/app/gerenciamento')) ?? false;
+    return (
+      item.children?.some((c) => {
+        if (c.route.startsWith('/app/gerenciamento')) return true;
+        return c.children?.some((n) => n.route.startsWith('/app/gerenciamento')) ?? false;
+      }) ?? false
+    );
   }
 }

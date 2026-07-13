@@ -5,7 +5,7 @@ import { environment } from '../../../../environments/environment';
 import { EstacionamentoPaths } from '../constants/estacionamento-api.paths';
 
 const API_BASE = environment.API_BASE_URL;
-const ESTACIONAMENTO = `${API_BASE}/Estacionamento`;
+const Estacionamento = `${API_BASE}/Estacionamento`;
 
 /** Opção para select/autocomplete (lookup). */
 export interface LookupOption {
@@ -15,23 +15,25 @@ export interface LookupOption {
 }
 
 /**
- * Lookup de Estacionamentos para formulários (ex.: usuário com perfil ESTACIONAMENTO).
- * Usa GET /api/Estacionamento/Buscar (Swagger: parâmetro Descricao).
- * @see https://gtsbackend.azurewebsites.net/swagger/v1/swagger.json
+ * Lookup de Estacionamentos para formulários (ex.: usuário com perfil Estacionamento).
+ * GET /api/Estacionamento?Descricao=...
  */
 @Injectable({ providedIn: 'root' })
 export class EstacionamentoLookupService {
   constructor(private http: HttpClient) {}
 
   /**
-   * Lista estacionamentos (primeira página) para combobox/listagem.
-   * Swagger: GET /api/Estacionamento/Buscar?NumeroPagina=1&TamanhoPagina=100
+   * Lista Estacionamentos (primeira página) para combobox/listagem.
+   * GET /api/Estacionamento?NumeroPagina=1&TamanhoPagina=100
    */
   list(): Observable<LookupOption[]> {
     const params = new URLSearchParams();
     params.set('NumeroPagina', '1');
     params.set('TamanhoPagina', '100');
-    const url = `${ESTACIONAMENTO}/${EstacionamentoPaths.buscar}?${params.toString()}`;
+    const listUrl = EstacionamentoPaths.buscar
+      ? `${Estacionamento}/${EstacionamentoPaths.buscar}`
+      : Estacionamento;
+    const url = `${listUrl}?${params.toString()}`;
     return this.http.get<unknown>(url).pipe(
       timeout(15000),
       map((body) => this.normalizeToOptions(body))
@@ -39,8 +41,8 @@ export class EstacionamentoLookupService {
   }
 
   /**
-   * Busca estacionamentos por Descricao (Razão Social / texto).
-   * Swagger: GET /api/Estacionamento/Buscar?Descricao=term&NumeroPagina=1&TamanhoPagina=20
+   * Busca Estacionamentos por Descricao (Razão Social / texto).
+   * GET /api/Estacionamento?Descricao=term&NumeroPagina=1&TamanhoPagina=20
    */
   search(term: string): Observable<LookupOption[]> {
     const t = (term ?? '').trim();
@@ -51,7 +53,10 @@ export class EstacionamentoLookupService {
     params.set('Descricao', t);
     params.set('NumeroPagina', '1');
     params.set('TamanhoPagina', '20');
-    const url = `${ESTACIONAMENTO}/${EstacionamentoPaths.buscar}?${params.toString()}`;
+    const listUrl = EstacionamentoPaths.buscar
+      ? `${Estacionamento}/${EstacionamentoPaths.buscar}`
+      : Estacionamento;
+    const url = `${listUrl}?${params.toString()}`;
     return this.http.get<unknown>(url).pipe(
       timeout(15000),
       map((body) => this.normalizeToOptions(body))
@@ -85,11 +90,11 @@ export class EstacionamentoLookupService {
   private itemToOption(row: Record<string, unknown>): LookupOption {
     const id = Number(row['id']) || 0;
     const nomeRazao = String(row['nomeRazaoSocial'] ?? row['descricao'] ?? '');
-    const doc = String(row['documento'] ?? '');
+    const cnpj = String(row['cnpj'] ?? row['documento'] ?? '');
     return {
       id,
-      label: nomeRazao ? `${nomeRazao} — ${doc || '-'}` : String(id),
-      cnpj: doc,
+      label: nomeRazao ? `${nomeRazao} — ${cnpj || '-'}` : String(id),
+      cnpj,
     };
   }
 }

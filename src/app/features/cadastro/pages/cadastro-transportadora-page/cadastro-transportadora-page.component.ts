@@ -1,60 +1,37 @@
-import { Component, OnInit, inject, ChangeDetectorRef, DestroyRef } from '@angular/core';
+import { Component, OnInit, inject, ChangeDetectorRef, DestroyRef, isDevMode } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CommonModule } from '@angular/common';
-import { FormsModule, ReactiveFormsModule, FormBuilder, FormGroup, Validators } from '@angular/forms';
-import { debounceTime, distinctUntilChanged, filter, switchMap } from 'rxjs';
+import { FormsModule, ReactiveFormsModule, FormBuilder, FormGroup, FormArray, Validators } from '@angular/forms';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import { debounceTime, distinctUntilChanged, filter, map, switchMap } from 'rxjs';
 import { TransportadoraService } from '../../services/transportadora.service';
 import { VeiculoService } from '../../services/veiculo.service';
 import { ViacepService } from '../../services/viacep.service';
-import { CnpjBrasilApiService } from '../../services/cnpj-brasilapi.service';
-import {
-  TransportadoraDTO,
-  TransportadoraListItemDTO,
-  TransportadoraEnderecoDTO
-} from '../../models/transportadora.dto';
+import { CnpjLookupResult, CnpjService } from '../../services/cnpj.service';
+import { TransportadoraListItemDTO } from '../../models/transportadora.dto';
 import { VeiculoDTO, VeiculoListItemDTO } from '../../models/veiculo.dto';
 import { CnpjFormValue } from '../../models/brasilapi-cnpj.model';
-import { validarCnpj, cnpjTem14Digitos } from '../../utils/cnpj.utils';
 import { CnpjFormatDirective, formatCnpj } from '../../directives/cnpj-format.directive';
 import { CpfFormatDirective, formatCpf } from '../../directives/cpf-format.directive';
 import { TelefoneFormatDirective } from '../../directives/telefone-format.directive';
 import { ToastService } from '../../../../core/api/services/toast.service';
+import {
+  MotoristaDTO,
+  MotoristaListItemDTO
+} from '../../models/motorista.dto';
+import { MotoristaService } from '../../services/motorista.service';
+import {
+  montarPayloadTransportadoraApi,
+  TransportadoraFormRawValue
+} from '../../mappers/transportadora-payload.mapper';
+import { ModalBuscaMotoristaComponent } from '../../../movimentos/entrada-saida/components/modal-busca-motorista/modal-busca-motorista.component';
+import { PaginatedSearchItem } from '../../../../shared/models/paginated-search.models';
+import { EstSummaryMetricComponent } from '../../components/est-summary-metric/est-summary-metric.component';
+import { EstStatusPillEstacionamentoComponent } from '../../components/est-status-pill-estacionamento/est-status-pill-estacionamento.component';
 
-export type TransportadoraTab = 'cadastro' | 'frota' | 'condutores';
+export type TransportadoraTab = 'cadastro' | 'frota' | 'motoristas';
+type ModalFrotaTab = 'veiculo' | 'motoristasVinculados';
 type TransportadoraSearchField = 'geral' | 'cnpj' | 'razaoSocial' | 'nomeFantasia' | 'email' | 'id';
-
-export interface CondutorMock {
-  id: number;
-  transportadoraId?: number | null;
-  nomeCompleto: string;
-  cpf: string;
-  celular: string;
-  email: string;
-  cnh: string;
-  categoriaCnh: string;
-  vencimentoCnh: string;
-  ativo: boolean;
-}
-
-interface VeiculoPendenteDraft {
-  localId: number;
-  placa: string;
-  condutorId: number | null;
-  veiculoModeloId: number | null;
-  marca: string;
-  modelo: string;
-  marcaModelo: string;
-  cor: string;
-  anoFabricacao: number | null;
-  anoModelo: number | null;
-  tipoVeiculo: string;
-  quantidadeEixos: string;
-  tipoPeso: string;
-  centroCusto: string;
-  ativo: boolean;
-}
-
-const TAMANHO_PAGINA = 50;
 
 @Component({
   selector: 'app-cadastro-transportadora-page',
@@ -63,9 +40,13 @@ const TAMANHO_PAGINA = 50;
     CommonModule,
     FormsModule,
     ReactiveFormsModule,
+    RouterLink,
     CnpjFormatDirective,
     CpfFormatDirective,
-    TelefoneFormatDirective
+    TelefoneFormatDirective,
+    ModalBuscaMotoristaComponent,
+    EstSummaryMetricComponent,
+    EstStatusPillEstacionamentoComponent,
   ],
   templateUrl: './cadastro-transportadora-page.component.html',
   styleUrls: ['./cadastro-transportadora-page.component.scss']
@@ -74,17 +55,24 @@ export class CadastroTransportadoraPageComponent implements OnInit {
   private transportadoraService = inject(TransportadoraService);
   private veiculoService = inject(VeiculoService);
   private viacep = inject(ViacepService);
-  private cnpjBrasilApi = inject(CnpjBrasilApiService);
+  private cnpjService = inject(CnpjService);
+  private motoristaService = inject(MotoristaService);
   private toast = inject(ToastService);
   private fb = inject(FormBuilder);
   private cdr = inject(ChangeDetectorRef);
   private destroyRef = inject(DestroyRef);
+  private route = inject(ActivatedRoute);
+  private router = inject(Router);
 
   activeTab: TransportadoraTab = 'cadastro';
 
   // --- Aba Cadastro (Transportadora) ---
   listView = true;
   transportadoraList: TransportadoraListItemDTO[] = [];
+  /** Alias somente leitura: mesmos dados exibidos na tabela (`transportadoraList`). */
+  get transportadoras(): TransportadoraListItemDTO[] {
+    return this.transportadoraList;
+  }
   loadingList = false;
   erroList: string | null = null;
   jaBuscou = false;
@@ -92,14 +80,28 @@ export class CadastroTransportadoraPageComponent implements OnInit {
   campoBusca: TransportadoraSearchField = 'geral';
   numeroPagina = 1;
   totalCount = 0;
+  /** Itens por página na grade (enviado ao GET Buscar). */
+  tamanhoPaginaLista = 10;
+  readonly opcoesTamanhoPaginaLista: number[] = [10, 25, 50];
   transportadoraForm!: FormGroup;
   salvando = false;
   erroForm: string | null = null;
   /** Busca automática CNPJ (BrasilAPI): loading e mensagem de erro abaixo do campo. */
   cnpjLoading = false;
   cnpjError: string | null = null;
-  /** ID da transportadora em edição (usado na Frota e Condutores). */
+  cnpjSuccess: string | null = null;
+  private ultimoCnpjConsultado = '';
+  /** ID da transportadora em edição (usado na Frota e Motoristas). */
   transportadoraId: number | null = null;
+
+  /** Corpo bruto do GET /api/Transportadora/{id} para merge correto no PUT (datas, ids). */
+  private transportadoraMergeRaw: Record<string, unknown> | null = null;
+
+  /** Accordion Endereço (campos do grupo `endereco`). */
+  complementaresOpen = false;
+
+  /** Accordion Contatos complementares (RL já está no card superior; aqui só complementares). */
+  contatosOpen = true;
 
   // --- Aba Frota (Veículos) ---
   veiculos: VeiculoListItemDTO[] = [];
@@ -108,8 +110,12 @@ export class CadastroTransportadoraPageComponent implements OnInit {
   veiculoForm!: FormGroup;
   veiculoEditId: number | null = null;
   salvandoVeiculo = false;
-  private veiculoDraftSeq = -1;
-  private veiculosPendentes: VeiculoPendenteDraft[] = [];
+  modalFrotaTab: ModalFrotaTab = 'veiculo';
+  /** Lookup de motorista no modal frota (mesmo padrão da tela Entrada/saída). */
+  frotaMotoristaModalAberto = false;
+  frotaMotoristaTexto = '';
+  frotaMotoristaLookupContext: 'veiculo' | 'vinculo' = 'veiculo';
+  motoristasVinculadosFrota: Array<{ id: number; nome: string; principal: boolean }> = [];
   /** Opções para quantidade de eixos (modal frota). */
   eixosOpcoes: number[] = [2, 3, 4, 5, 6, 7, 8, 9];
   /** Opções para veículo leve/pesado. */
@@ -121,44 +127,128 @@ export class CadastroTransportadoraPageComponent implements OnInit {
   showImportarFrota = false;
   fileFrota: File | null = null;
 
-  // --- Aba Condutores (TODO: integrar com endpoint do backend) ---
-  condutoresMock: CondutorMock[] = [];
+  // --- Aba Motoristas ---
+  condutores: MotoristaListItemDTO[] = [];
+  loadingCondutores = false;
   showCondutorForm = false;
-  condutorForm!: FormGroup;
+  motoristaForm!: FormGroup;
   condutorEditId: number | null = null;
+  salvandoMotorista = false;
   showImportarCondutores = false;
   fileCondutores: File | null = null;
+  private bloquearFecharModalAte = 0;
 
   ngOnInit(): void {
     this.criarFormTransportadora();
-    this.setupCnpjBusca();
+    this.setupCnpjBuscaAutomatica();
     this.criarFormVeiculo();
-    this.criarFormCondutor();
+    this.criarFormMotorista();
+
+    this.route.paramMap
+      .pipe(
+        map((pm) => pm.get('id')),
+        distinctUntilChanged(),
+        takeUntilDestroyed(this.destroyRef)
+      )
+      .subscribe((idStr) => {
+        if (!idStr) return;
+        const id = Number(idStr);
+        if (!Number.isFinite(id) || id <= 0) return;
+        this.listView = false;
+        this.carregarTransportadoraParaEdicao(id);
+      });
+
+    const forceTab = this.route.snapshot.data['forceTab'];
+    if (forceTab === 'motoristas') {
+      this.setTab('motoristas');
+    }
+  }
+
+  /**
+   * Obrigatórios ainda pendentes no painel lateral: validadores do formulário (PJ + e-mail)
+   * e endereço principal com o mesmo critério do preenchimento (%).
+   */
+  get cadastroObrigatoriosPendentesLabels(): string[] {
+    if (!this.transportadoraForm) return [];
+    const f = this.transportadoraForm;
+    const p: string[] = [];
+    if (f.get('pessoa.razaoSocial')?.invalid) p.push('Razão social');
+    const cnpjOk = String(f.get('pessoa.cnpj')?.value ?? '').replace(/\D/g, '').length === 14;
+    if (!cnpjOk) p.push('CNPJ');
+    const eg = f.get('endereco') as FormGroup;
+    const cep = String(eg?.get('cep')?.value ?? '').replace(/\D/g, '');
+    const log = String(eg?.get('logradouro')?.value ?? '').trim();
+    const cid = String(eg?.get('cidade')?.value ?? '').trim();
+    if (cep.length < 8) p.push('CEP do endereço');
+    if (log.length < 2) p.push('Logradouro do endereço');
+    if (cid.length < 2) p.push('Cidade do endereço');
+    return p;
+  }
+
+  /** Progresso do preenchimento (0–100) para o painel lateral — espelha a lógica do cadastro estacionamento. */
+  get cadastroFillProgressPercent(): number {
+    if (!this.transportadoraForm) return 0;
+    const f = this.transportadoraForm;
+    let ok = 0;
+    const total = 9;
+    const doc = String(f.get('pessoa.cnpj')?.value ?? '').replace(/\D/g, '');
+    if (doc.length === 14) ok++;
+    if (String(f.get('pessoa.razaoSocial')?.value ?? '').trim().length >= 2) ok++;
+    if (String(f.get('responsavelLegal.nome')?.value ?? '').trim().length >= 2) ok++;
+    const cpf = String(f.get('responsavelLegal.cpf')?.value ?? '').replace(/\D/g, '');
+    if (cpf.length === 11) ok++;
+    const tel = String(f.get('responsavelLegal.telefone')?.value ?? '').replace(/\D/g, '');
+    if (tel.length >= 10) ok++;
+    if (String(f.get('pessoa.nomeFantasia')?.value ?? '').trim().length > 0) ok++;
+    const eg = f.get('endereco') as FormGroup;
+    const cep = String(eg?.get('cep')?.value ?? '').replace(/\D/g, '');
+    const log = String(eg?.get('logradouro')?.value ?? '').trim();
+    const cid = String(eg?.get('cidade')?.value ?? '').trim();
+    if (cep.length >= 8 && log.length >= 2 && cid.length >= 2) ok += 3;
+    return Math.min(100, Math.round((ok / total) * 100));
+  }
+
+  resumoCnpjFormatado(): string {
+    const raw = String(this.transportadoraForm?.get('pessoa.cnpj')?.value ?? '');
+    return formatCnpj(raw);
+  }
+
+  toggleComplementares(): void {
+    this.complementaresOpen = !this.complementaresOpen;
+  }
+
+  toggleContatos(): void {
+    this.contatosOpen = !this.contatosOpen;
   }
 
   setTab(tab: TransportadoraTab): void {
     this.activeTab = tab;
-    if (tab === 'frota') this.carregarVeiculos();
+    if (tab === 'frota') {
+      this.carregarVeiculos();
+      this.carregarCondutores();
+    }
+    if (tab === 'motoristas') this.carregarCondutores();
   }
 
   // ---------- Aba Cadastro ----------
   criarFormTransportadora(): void {
     this.transportadoraForm = this.fb.group({
       id: [null as number | null],
-      razaoSocial: ['', [Validators.required, Validators.minLength(2)]],
-      nomeFantasia: [''],
-      cnpj: ['', [Validators.required]],
-      inscricaoEstadual: [''],
-      email: ['', [Validators.email]],
-      telefone: [''],
-      ativo: [true],
-      responsavelNome: [''],
-      responsavelCpf: [''],
-      responsavelCelular: [''],
-      responsavelEmail: [''],
-      responsavelCargo: [''],
-      tipoAcesso: ['Unidade única'],
-      observacaoInterna: [''],
+      pessoa: this.fb.group({
+        razaoSocial: ['', [Validators.required, Validators.minLength(2)]],
+        nomeFantasia: [''],
+        cnpj: ['', [Validators.required]],
+        inscricaoEstadual: [''],
+        ativo: [true]
+      }),
+      responsavelLegal: this.fb.group({
+        nome: [''],
+        cpf: [''],
+        telefone: [''],
+        email: ['', Validators.email],
+        cargo: ['']
+      }),
+      contatosComplementares: this.fb.array([] as FormGroup[]),
       endereco: this.fb.group({
         cep: [''],
         logradouro: [''],
@@ -171,40 +261,66 @@ export class CadastroTransportadoraPageComponent implements OnInit {
     });
   }
 
+  get contatosComplementares(): FormArray {
+    return this.transportadoraForm.get('contatosComplementares') as FormArray;
+  }
+
+  private criarGrupoContatoComplementar(values?: {
+    nome?: string;
+    cpf?: string;
+    telefone?: string;
+    email?: string;
+  }): FormGroup {
+    return this.fb.group({
+      nome: [values?.nome ?? ''],
+      cpf: [values?.cpf ?? ''],
+      telefone: [values?.telefone ?? ''],
+      email: [values?.email ?? '', Validators.email]
+    });
+  }
+
+  adicionarContatoComplementar(): void {
+    this.contatosComplementares.push(this.criarGrupoContatoComplementar());
+    this.cdr.markForCheck();
+  }
+
+  removerContatoComplementar(index: number): void {
+    this.contatosComplementares.removeAt(index);
+    this.cdr.markForCheck();
+  }
+
   /**
-   * Configura busca automática de CNPJ (BrasilAPI): debounce 500ms no valueChanges e ao sair do campo (blur).
-   * Só consulta quando tiver 14 dígitos e CNPJ válido. Preenche apenas campos vazios.
+   * Busca automática por CNPJ: debounce + distinct + switchMap.
+   * Blur permanece como reforço para garantir consulta ao sair do campo.
    */
-  private setupCnpjBusca(): void {
-    const cnpjControl = this.transportadoraForm.get('cnpj');
+  private setupCnpjBuscaAutomatica(): void {
+    const cnpjControl = this.transportadoraForm.get('pessoa.cnpj');
     if (!cnpjControl) return;
     cnpjControl.valueChanges
       .pipe(
-        debounceTime(500),
+        map((v) => this.cnpjService.normalizeCnpj(v)),
+        debounceTime(700),
         distinctUntilChanged(),
-        filter((v) => cnpjTem14Digitos(v) && validarCnpj(v)),
+        filter((v) => v.length > 0),
         switchMap((v) => {
           this.cnpjLoading = true;
           this.cnpjError = null;
+          this.cnpjSuccess = null;
           this.cdr.markForCheck();
-          return this.cnpjBrasilApi.buscar(v);
+          return this.cnpjService.consultarCnpj(v);
         }),
         takeUntilDestroyed(this.destroyRef)
       )
       .subscribe({
-        next: (res) => {
+        next: (result) => {
           this.cnpjLoading = false;
-          if (res == null) {
-            this.cnpjError = 'CNPJ não encontrado.';
-          } else {
-            this.cnpjError = null;
-            this.applyCnpjToForm(res);
-          }
+          this.handleConsultaCnpjResult(result);
           this.cdr.markForCheck();
         },
         error: () => {
           this.cnpjLoading = false;
-          this.cnpjError = 'Não foi possível buscar os dados do CNPJ.';
+          this.cnpjError = 'Não foi possível consultar os dados do CNPJ no momento.';
+          this.cnpjSuccess = null;
           this.cdr.markForCheck();
         }
       });
@@ -213,23 +329,28 @@ export class CadastroTransportadoraPageComponent implements OnInit {
   /** Aplica dados da consulta de CNPJ ao formulário apenas em campos vazios (não sobrescreve alterações do usuário). */
   private applyCnpjToForm(value: CnpjFormValue): void {
     const form = this.transportadoraForm;
+    const pessoa = form.get('pessoa');
+    const responsavel = form.get('responsavelLegal');
     const isEmpty = (v: unknown) => v == null || String(v).trim() === '';
 
-    if (value.razaoSocial && isEmpty(form.get('razaoSocial')?.value)) {
-      form.get('razaoSocial')?.setValue(value.razaoSocial, { emitEvent: false });
+    if (value.razaoSocial && isEmpty(pessoa?.get('razaoSocial')?.value)) {
+      pessoa?.get('razaoSocial')?.setValue(value.razaoSocial, { emitEvent: false });
     }
-    if (value.nomeFantasia && isEmpty(form.get('nomeFantasia')?.value)) {
-      form.get('nomeFantasia')?.setValue(value.nomeFantasia, { emitEvent: false });
+    if (value.nomeFantasia && isEmpty(pessoa?.get('nomeFantasia')?.value)) {
+      pessoa?.get('nomeFantasia')?.setValue(value.nomeFantasia, { emitEvent: false });
     }
-    form.get('ativo')?.setValue(value.ativo, { emitEvent: false });
-    if (value.inscricaoEstadual != null && value.inscricaoEstadual.trim() && isEmpty(form.get('inscricaoEstadual')?.value)) {
-      form.get('inscricaoEstadual')?.setValue(value.inscricaoEstadual.trim(), { emitEvent: false });
+    const ativoControl = pessoa?.get('ativo');
+    if (ativoControl?.pristine) {
+      ativoControl.setValue(value.ativo, { emitEvent: false });
     }
-    if (value.email != null && value.email.trim() && isEmpty(form.get('email')?.value)) {
-      form.get('email')?.setValue(value.email.trim(), { emitEvent: false });
+    if (value.inscricaoEstadual != null && value.inscricaoEstadual.trim() && isEmpty(pessoa?.get('inscricaoEstadual')?.value)) {
+      pessoa?.get('inscricaoEstadual')?.setValue(value.inscricaoEstadual.trim(), { emitEvent: false });
     }
-    if (value.telefone != null && value.telefone.trim() && isEmpty(form.get('telefone')?.value)) {
-      form.get('telefone')?.setValue(value.telefone.trim(), { emitEvent: false });
+    if (value.email != null && value.email.trim() && isEmpty(pessoa?.get('email')?.value)) {
+      pessoa?.get('email')?.setValue(value.email.trim(), { emitEvent: false });
+    }
+    if (value.telefone != null && value.telefone.trim() && isEmpty(responsavel?.get('telefone')?.value)) {
+      responsavel?.get('telefone')?.setValue(value.telefone.trim(), { emitEvent: false });
     }
 
     if (value.endereco) {
@@ -260,33 +381,61 @@ export class CadastroTransportadoraPageComponent implements OnInit {
     }
   }
 
-  /** Dispara busca por CNPJ ao sair do campo (blur), se tiver 14 dígitos válidos. */
+  /** Dispara busca por CNPJ ao sair do campo (blur). */
   onCnpjBlur(): void {
-    const cnpj = this.transportadoraForm.get('cnpj')?.value ?? '';
-    if (!cnpjTem14Digitos(cnpj) || !validarCnpj(cnpj) || this.cnpjLoading) return;
+    this.buscarCnpj();
+  }
+
+  buscarCnpj(): void {
+    const cnpjControl = this.transportadoraForm.get('pessoa.cnpj');
+    cnpjControl?.markAsTouched();
+    const cnpjRaw = cnpjControl?.value ?? '';
+    const normalized = this.cnpjService.normalizeCnpj(cnpjRaw);
+    if (this.cnpjLoading) return;
+    if (normalized && normalized === this.ultimoCnpjConsultado && !this.cnpjError) return;
+
     this.cnpjLoading = true;
     this.cnpjError = null;
+    this.cnpjSuccess = null;
     this.cdr.markForCheck();
-    this.cnpjBrasilApi.buscar(cnpj).subscribe({
-      next: (res) => {
+
+    this.cnpjService.consultarCnpj(cnpjRaw).subscribe({
+      next: (result) => {
         this.cnpjLoading = false;
-        if (res == null) {
-          this.cnpjError = 'CNPJ não encontrado.';
-        } else {
-          this.cnpjError = null;
-          this.applyCnpjToForm(res);
-        }
+        this.handleConsultaCnpjResult(result);
         this.cdr.markForCheck();
       },
       error: () => {
         this.cnpjLoading = false;
-        this.cnpjError = 'Não foi possível buscar os dados do CNPJ.';
+        this.cnpjError = 'Não foi possível consultar os dados do CNPJ no momento.';
+        this.cnpjSuccess = null;
         this.cdr.markForCheck();
       }
     });
   }
 
-  /** Listagem sempre via GET /api/Transportadora/Buscar (backend). */
+  private handleConsultaCnpjResult(result: CnpjLookupResult): void {
+    this.ultimoCnpjConsultado = result.normalizedCnpj;
+    this.cnpjError = null;
+    this.cnpjSuccess = null;
+
+    if (result.status === 'success' && result.data) {
+      this.applyCnpjToForm(result.data);
+      this.cnpjSuccess = result.message;
+      return;
+    }
+
+    if (result.status !== 'incomplete') {
+      this.cnpjError = result.message;
+      return;
+    }
+
+    if (this.transportadoraForm.get('pessoa.cnpj')?.touched) {
+      this.cnpjError = result.message;
+    }
+  }
+
+  /** Listagem via GET /api/Transportadora?... */
   carregarLista(): void {
     this.jaBuscou = true;
     this.loadingList = true;
@@ -294,15 +443,18 @@ export class CadastroTransportadoraPageComponent implements OnInit {
     const termo = this.normalizeSearchTerm(this.termoBusca, this.campoBusca);
     const propriedade = this.resolveSearchProperty(this.campoBusca);
     this.transportadoraService
-      .buscar({
+      .listarTransportadoras({
         Termo: termo || undefined,
         Propriedade: propriedade,
         NumeroPagina: this.numeroPagina,
-        TamanhoPagina: TAMANHO_PAGINA
+        TamanhoPagina: this.tamanhoPaginaLista
       })
       .subscribe({
         next: (paged) => {
           this.transportadoraList = paged.items;
+          if (isDevMode()) {
+            console.log('LISTA USADA NA TABELA', this.transportadoras);
+          }
           this.totalCount = paged.totalCount;
           this.loadingList = false;
           this.cdr.markForCheck();
@@ -333,8 +485,72 @@ export class CadastroTransportadoraPageComponent implements OnInit {
       case 'id':
         return 'Digite o ID';
       default:
-        return 'Pesquisar';
+        return 'Pesquisar por razão social, nome fantasia, CNPJ ou e-mail...';
     }
+  }
+
+  /** Total de páginas da listagem atual. */
+  get totalPaginasLista(): number {
+    if (this.tamanhoPaginaLista <= 0) return 1;
+    return Math.max(1, Math.ceil(this.totalCount / this.tamanhoPaginaLista));
+  }
+
+  get intervaloLista(): { de: number; ate: number } {
+    if (this.totalCount <= 0) return { de: 0, ate: 0 };
+    const de = (this.numeroPagina - 1) * this.tamanhoPaginaLista + 1;
+    const ate = Math.min(this.numeroPagina * this.tamanhoPaginaLista, this.totalCount);
+    return { de, ate };
+  }
+
+  get countAtivasPagina(): number {
+    return this.transportadoraList.filter((i) => i.ativo).length;
+  }
+
+  get countInativasPagina(): number {
+    return this.transportadoraList.filter((i) => !i.ativo).length;
+  }
+
+  get resumoListaPaginaHint(): string | null {
+    return this.totalPaginasLista > 1 ? 'Nesta página' : null;
+  }
+
+  onTamanhoPaginaListaChange(size: number | string): void {
+    const n = Number(size);
+    if (!Number.isFinite(n) || n <= 0) return;
+    this.tamanhoPaginaLista = n;
+    this.numeroPagina = 1;
+    if (this.jaBuscou) this.carregarLista();
+  }
+
+  irParaPaginaLista(pagina: number): void {
+    const p = Math.max(1, Math.min(pagina, this.totalPaginasLista));
+    if (p === this.numeroPagina) return;
+    this.numeroPagina = p;
+    this.carregarLista();
+  }
+
+  irPrimeiraPaginaLista(): void {
+    this.irParaPaginaLista(1);
+  }
+
+  irUltimaPaginaLista(): void {
+    this.irParaPaginaLista(this.totalPaginasLista);
+  }
+
+  /** Exibe data/hora na coluna Atualização; tolera ISO ou string não parseável. */
+  formatDataAtualizacaoLista(raw: string | null | undefined): string {
+    if (raw == null || String(raw).trim() === '') return '—';
+    const d = new Date(raw);
+    if (!Number.isNaN(d.getTime())) {
+      return new Intl.DateTimeFormat('pt-BR', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      }).format(d);
+    }
+    return String(raw).trim();
   }
 
   private resolveSearchProperty(field: TransportadoraSearchField): string | undefined {
@@ -364,22 +580,24 @@ export class CadastroTransportadoraPageComponent implements OnInit {
   novoTransportadora(): void {
     this.listView = false;
     this.transportadoraId = null;
+    this.transportadoraMergeRaw = null;
+    this.contatosComplementares.clear();
     this.transportadoraForm.reset({
       id: null,
-      razaoSocial: '',
-      nomeFantasia: '',
-      cnpj: '',
-      inscricaoEstadual: '',
-      email: '',
-      telefone: '',
-      ativo: true,
-      responsavelNome: '',
-      responsavelCpf: '',
-      responsavelCelular: '',
-      responsavelEmail: '',
-      responsavelCargo: '',
-      tipoAcesso: 'Unidade única',
-      observacaoInterna: '',
+      pessoa: {
+        razaoSocial: '',
+        nomeFantasia: '',
+        cnpj: '',
+        inscricaoEstadual: '',
+        ativo: true
+      },
+      responsavelLegal: {
+        nome: '',
+        cpf: '',
+        telefone: '',
+        email: '',
+        cargo: ''
+      },
       endereco: {
         cep: '',
         logradouro: '',
@@ -392,34 +610,39 @@ export class CadastroTransportadoraPageComponent implements OnInit {
     });
     this.erroForm = null;
     this.cnpjError = null;
-    this.veiculosPendentes = [];
     this.veiculos = [];
-    this.condutoresMock = [];
+    this.condutores = [];
   }
 
-  editarTransportadora(item: TransportadoraListItemDTO): void {
-    this.listView = false;
+  /** Preenche o formulário a partir do GET /api/Transportadora/{id} (rota `editar/:id` ou recarga). */
+  private carregarTransportadoraParaEdicao(id: number): void {
     this.erroForm = null;
     this.cnpjError = null;
-    this.transportadoraService.obterPorId(item.id).subscribe((dto) => {
-      if (dto) {
-        this.transportadoraId = dto.id ?? null;
+    this.transportadoraService.obterTransportadoraPorIdComCorpo(id).subscribe((det) => {
+      if (det?.dto) {
+        const dto = det.dto;
+        this.transportadoraMergeRaw = det.raw;
+        this.transportadoraId = dto.id != null && dto.id > 0 ? dto.id : id;
+        this.contatosComplementares.clear();
+        for (const c of dto.contatosComplementares ?? []) {
+          this.contatosComplementares.push(this.criarGrupoContatoComplementar(c));
+        }
         this.transportadoraForm.patchValue({
           id: dto.id,
-          razaoSocial: dto.razaoSocial,
-          nomeFantasia: dto.nomeFantasia ?? '',
-          cnpj: dto.cnpj,
-          inscricaoEstadual: dto.inscricaoEstadual ?? '',
-          email: dto.email ?? '',
-          telefone: dto.telefone ?? '',
-          ativo: dto.ativo,
-          responsavelNome: dto.responsavelNome ?? '',
-          responsavelCpf: dto.responsavelCpf ?? '',
-          responsavelCelular: dto.responsavelCelular ?? '',
-          responsavelEmail: dto.responsavelEmail ?? '',
-          responsavelCargo: dto.responsavelCargo ?? '',
-          tipoAcesso: dto.tipoAcesso ?? 'Unidade única',
-          observacaoInterna: dto.observacaoInterna ?? '',
+          pessoa: {
+            razaoSocial: dto.razaoSocial,
+            nomeFantasia: dto.nomeFantasia ?? '',
+            cnpj: dto.cnpj,
+            inscricaoEstadual: dto.inscricaoEstadual ?? '',
+            ativo: dto.ativo
+          },
+          responsavelLegal: {
+            nome: dto.responsavelNome ?? '',
+            cpf: dto.responsavelCpf ?? '',
+            telefone: dto.responsavelCelular ?? dto.telefone ?? '',
+            email: dto.responsavelEmail ?? '',
+            cargo: dto.responsavelCargo ?? ''
+          },
           endereco: dto.endereco
             ? {
                 cep: dto.endereco.cep ?? '',
@@ -432,6 +655,10 @@ export class CadastroTransportadoraPageComponent implements OnInit {
               }
             : { cep: '', logradouro: '', numero: '', bairro: '', cidade: '', estado: '', complemento: '' }
         });
+        this.carregarCondutores();
+      } else {
+        this.erroForm = 'Não foi possível carregar os dados da transportadora.';
+        this.toast.error(this.erroForm);
       }
       this.cdr.markForCheck();
     });
@@ -440,6 +667,7 @@ export class CadastroTransportadoraPageComponent implements OnInit {
   voltarLista(): void {
     this.listView = true;
     this.activeTab = 'cadastro';
+    void this.router.navigate(['/app/cadastro/transportadora']);
     this.carregarLista();
   }
 
@@ -464,67 +692,121 @@ export class CadastroTransportadoraPageComponent implements OnInit {
       this.transportadoraForm.markAllAsTouched();
       return;
     }
-    const v = this.transportadoraForm.value;
-    const dto: TransportadoraDTO = {
-      id: v.id ?? undefined,
-      razaoSocial: v.razaoSocial,
-      nomeFantasia: v.nomeFantasia,
-      cnpj: v.cnpj.replace(/\D/g, ''),
-      inscricaoEstadual: v.inscricaoEstadual || undefined,
-      email: v.email,
-      telefone: v.telefone || undefined,
-      ativo: v.ativo,
-      responsavelNome: v.responsavelNome || undefined,
-      responsavelCpf: v.responsavelCpf?.replace(/\D/g, '') || undefined,
-      responsavelCelular: v.responsavelCelular || undefined,
-      responsavelEmail: v.responsavelEmail || undefined,
-      responsavelCargo: v.responsavelCargo || undefined,
-      tipoAcesso: v.tipoAcesso,
-      observacaoInterna: v.observacaoInterna || undefined,
-      endereco: v.endereco?.cep
-        ? ({
-            cep: v.endereco.cep,
-            logradouro: v.endereco.logradouro,
-            numero: v.endereco.numero,
-            bairro: v.endereco.bairro,
-            cidade: v.endereco.cidade,
-            estado: v.endereco.estado,
-            complemento: v.endereco.complemento
-          } as TransportadoraEnderecoDTO)
-        : undefined
-    };
+    const formId = Number(this.transportadoraForm.get('id')?.value) || 0;
+    if (formId > 0 && !this.transportadoraMergeRaw) {
+      this.salvando = true;
+      this.erroForm = null;
+      this.transportadoraService.obterTransportadoraPorIdComCorpo(formId).subscribe({
+        next: (det) => {
+          if (det?.raw) {
+            this.transportadoraMergeRaw = det.raw;
+          }
+          this.salvando = false;
+          this.executarRequisicaoSalvarTransportadora();
+          this.cdr.markForCheck();
+        },
+        error: () => {
+          this.salvando = false;
+          this.erroForm = 'Não foi possível recarregar o cadastro para salvar. Tente novamente.';
+          this.cdr.markForCheck();
+        }
+      });
+      return;
+    }
+    this.executarRequisicaoSalvarTransportadora();
+  }
+
+  private executarRequisicaoSalvarTransportadora(): void {
+    const rawForm = this.transportadoraForm.getRawValue() as TransportadoraFormRawValue;
+    const nowIso = new Date().toISOString();
+    const payload = montarPayloadTransportadoraApi(rawForm, this.transportadoraMergeRaw, nowIso);
+    const idPayload = Number(payload['id']) || 0;
+    const wasEdit = idPayload > 0;
+
     this.salvando = true;
     this.erroForm = null;
-    const obs = dto.id
-      ? this.transportadoraService.alterar(dto)
-      : this.transportadoraService.gravar(dto);
+    const obs = wasEdit
+      ? this.transportadoraService.atualizarTransportadora(payload)
+      : this.transportadoraService.criarTransportadora(payload);
     obs.subscribe({
       next: (saved) => {
         this.transportadoraId = saved.id ?? null;
         this.transportadoraForm.patchValue({ id: saved.id ?? null }, { emitEvent: false });
-        this.condutoresMock = this.condutoresMock.map((c) => ({
-          ...c,
-          transportadoraId: c.transportadoraId ?? this.transportadoraId ?? undefined
-        }));
+        const sid = saved.id;
+        if (sid) {
+          this.transportadoraService.obterTransportadoraPorIdComCorpo(sid).subscribe((det) => {
+            if (det?.raw) {
+              this.transportadoraMergeRaw = det.raw;
+            }
+            this.cdr.markForCheck();
+          });
+        }
         this.salvando = false;
-        this.publicarVeiculosPendentes();
         this.carregarVeiculos();
-        this.toast.success(dto.id ? 'Transportadora atualizada com sucesso.' : 'Transportadora cadastrada com sucesso.');
+        this.carregarCondutores();
+        this.toast.success(wasEdit ? 'Transportadora atualizada com sucesso.' : 'Transportadora cadastrada com sucesso.');
         this.cdr.markForCheck();
       },
-      error: (err: { message?: string }) => {
-        this.erroForm = (err?.message && err.message.trim()) ? err.message : 'Erro ao salvar. Tente novamente.';
+      error: (err: unknown) => {
+        if (isDevMode()) {
+          console.error('Erro ao salvar transportadora', { payload, err });
+        }
+        this.erroForm = this.mensagemDetalheErroSalvar(err);
         this.salvando = false;
         this.cdr.markForCheck();
       }
     });
   }
 
+  private mensagemDetalheErroSalvar(err: unknown): string {
+    const fallback = this.getMensagemAmigavelErroSalvar(err as { status?: number });
+    const e = err as { error?: unknown };
+    const body = e.error;
+    if (typeof body === 'string' && body.trim()) {
+      return body.trim();
+    }
+    if (body && typeof body === 'object') {
+      const o = body as Record<string, unknown>;
+      if (typeof o['detail'] === 'string' && o['detail'].trim()) {
+        return String(o['detail']).trim();
+      }
+      if (typeof o['title'] === 'string' && o['title'].trim()) {
+        return String(o['title']).trim();
+      }
+      const errs = o['errors'];
+      if (errs && typeof errs === 'object') {
+        const parts: string[] = [];
+        for (const v of Object.values(errs as Record<string, unknown[]>)) {
+          if (Array.isArray(v)) {
+            parts.push(...v.map((x) => String(x)));
+          }
+        }
+        if (parts.length) {
+          return parts.join(' ');
+        }
+      }
+    }
+    return fallback;
+  }
+
+  private onlyDigits(value: unknown): string {
+    return String(value ?? '').replace(/\D/g, '');
+  }
+
+  private getMensagemAmigavelErroSalvar(err: { status?: number; message?: string } | null | undefined): string {
+    const status = err?.status;
+    if (status === 400) return 'Não foi possível salvar a transportadora. Verifique os campos obrigatórios.';
+    if (status === 401 || status === 403) return 'Sessão expirada. Faça login novamente.';
+    if (status === 0) return 'Não foi possível conectar ao servidor.';
+    if (status != null && status >= 500) return 'Erro interno ao processar o cadastro. Verifique o contrato da API.';
+    return 'Não foi possível salvar a transportadora. Tente novamente.';
+  }
+
   excluirTransportadora(): void {
     const id = this.transportadoraForm.get('id')?.value;
     if (!id) return;
     if (!confirm('Confirma a exclusão desta transportadora?')) return;
-    this.transportadoraService.excluir(id).subscribe({
+    this.transportadoraService.excluirTransportadora(id).subscribe({
       next: () => {
         this.transportadoraId = null;
         this.voltarLista();
@@ -532,6 +814,24 @@ export class CadastroTransportadoraPageComponent implements OnInit {
       },
       error: () => {
         this.erroForm = 'Erro ao excluir.';
+        this.cdr.markForCheck();
+      }
+    });
+  }
+
+  /** Exclusão a partir da tabela de consulta (lista). */
+  excluirTransportadoraLista(item: TransportadoraListItemDTO): void {
+    const id = item?.id;
+    if (!id || id <= 0) return;
+    if (!confirm('Confirma a exclusão desta transportadora?')) return;
+    this.transportadoraService.excluirTransportadora(id).subscribe({
+      next: () => {
+        this.toast.success('Transportadora excluída com sucesso.');
+        this.carregarLista();
+        this.cdr.markForCheck();
+      },
+      error: () => {
+        this.toast.error('Erro ao excluir transportadora.');
         this.cdr.markForCheck();
       }
     });
@@ -545,7 +845,7 @@ export class CadastroTransportadoraPageComponent implements OnInit {
   // ---------- Aba Frota (Veículos) ----------
   carregarVeiculos(): void {
     if (this.transportadoraId == null) {
-      this.veiculos = this.mapVeiculosPendentesParaLista();
+      this.veiculos = [];
       this.loadingVeiculos = false;
       this.cdr.markForCheck();
       return;
@@ -559,12 +859,12 @@ export class CadastroTransportadoraPageComponent implements OnInit {
       })
       .subscribe({
         next: (paged) => {
-          this.veiculos = [...paged.items, ...this.mapVeiculosPendentesParaLista()];
+          this.veiculos = paged.items;
           this.loadingVeiculos = false;
           this.cdr.markForCheck();
         },
         error: () => {
-          this.veiculos = this.mapVeiculosPendentesParaLista();
+          this.veiculos = [];
           this.loadingVeiculos = false;
           this.cdr.markForCheck();
         }
@@ -575,7 +875,7 @@ export class CadastroTransportadoraPageComponent implements OnInit {
     this.veiculoForm = this.fb.group({
       id: [null as number | null],
       placa: ['', [Validators.required, Validators.minLength(7)]],
-      condutorId: [null as number | null],
+      motoristaId: [null as number | null],
       veiculoModeloId: [null as number | null],
       marca: [''],
       modelo: [''],
@@ -622,12 +922,11 @@ export class CadastroTransportadoraPageComponent implements OnInit {
             const idx = marcaModelo.indexOf(' ');
             const marca = idx >= 0 ? marcaModelo.slice(0, idx) : marcaModelo;
             const modelo = idx >= 0 ? marcaModelo.slice(idx + 1) : '';
-            const dtoExt = dto as unknown as Record<string, unknown>;
             this.veiculoEditId = dto.id ?? null;
             this.veiculoForm.patchValue({
               id: dto.id,
               placa: dto.placa,
-              condutorId: dtoExt['condutorId'] ?? null,
+              motoristaId: dto.motoristaId ?? null,
               veiculoModeloId: dto.veiculoModeloId,
               marca,
               modelo,
@@ -636,24 +935,34 @@ export class CadastroTransportadoraPageComponent implements OnInit {
               anoFabricacao: dto.anoFabricacao,
               anoModelo: dto.anoModelo,
               tipoVeiculo: dto.tipoVeiculo,
-              quantidadeEixos: dtoExt['quantidadeEixos'] ?? '',
-              tipoPeso: dtoExt['tipoPeso'] ?? '',
+              quantidadeEixos: dto.quantidadeEixos != null ? String(dto.quantidadeEixos) : '',
+              tipoPeso: dto.tipoPeso ?? '',
               transportadoraId: dto.transportadoraId ?? this.transportadoraId,
               centroCusto: dto.centroCusto,
               ativo: dto.ativo
             });
+            this.aplicarVinculosMotoristasDoVeiculoDto(dto);
             this.cdr.markForCheck();
           });
         }
       });
   }
 
-  abrirNovoVeiculo(): void {
+  abrirNovoVeiculo(event?: Event): void {
+    event?.stopPropagation();
+    if (!this.veiculoForm) {
+      this.criarFormVeiculo();
+    }
     this.veiculoEditId = null;
+    this.modalFrotaTab = 'veiculo';
+    this.frotaMotoristaModalAberto = false;
+    this.frotaMotoristaTexto = '';
+    this.frotaMotoristaLookupContext = 'veiculo';
+    this.motoristasVinculadosFrota = [];
     this.veiculoForm.reset({
       id: null,
       placa: '',
-      condutorId: null,
+      motoristaId: null,
       veiculoModeloId: null,
       marca: '',
       modelo: '',
@@ -669,15 +978,27 @@ export class CadastroTransportadoraPageComponent implements OnInit {
       ativo: true
     });
     this.ensureTransportadoraListForFrota();
+    this.agendarAbrirModalVeiculo();
+  }
+
+  /** Backdrop: fecha só se o clique foi no overlay (não no card). */
+  onBackdropVeiculoClick(event: MouseEvent): void {
+    if (event.target !== event.currentTarget) return;
+    this.fecharModalFrota(event);
+  }
+
+  /** Mesmo padrão dos outros modais da página (Importar / Motorista): flag + detecção síncrona. */
+  private agendarAbrirModalVeiculo(): void {
+    this.bloquearFecharModalAte = Date.now() + 500;
     this.showVeiculoForm = true;
-    this.cdr.markForCheck();
+    this.cdr.detectChanges();
   }
 
   /** Garante lista de transportadoras para o select do modal (carrega se vazia). */
   private ensureTransportadoraListForFrota(): void {
     if (this.transportadoraList.length === 0) {
       this.loadingList = true;
-      this.transportadoraService.buscar({ NumeroPagina: 1, TamanhoPagina: 100 }).subscribe({
+      this.transportadoraService.listarTransportadoras({ NumeroPagina: 1, TamanhoPagina: 100 }).subscribe({
         next: (res) => {
           this.transportadoraList = res.items;
           this.loadingList = false;
@@ -691,110 +1012,91 @@ export class CadastroTransportadoraPageComponent implements OnInit {
     }
   }
 
-  editarVeiculo(v: VeiculoListItemDTO): void {
-    if (v.id <= 0) {
-      const draft = this.veiculosPendentes.find((item) => item.localId === v.id);
-      if (!draft) return;
-      this.veiculoEditId = draft.localId;
-      this.veiculoForm.patchValue({
-        id: draft.localId,
-        placa: draft.placa,
-        condutorId: draft.condutorId,
-        veiculoModeloId: draft.veiculoModeloId,
-        marca: draft.marca,
-        modelo: draft.modelo,
-        marcaModelo: draft.marcaModelo,
-        cor: draft.cor,
-        anoFabricacao: draft.anoFabricacao,
-        anoModelo: draft.anoModelo,
-        tipoVeiculo: draft.tipoVeiculo,
-        quantidadeEixos: draft.quantidadeEixos,
-        tipoPeso: draft.tipoPeso,
-        transportadoraId: this.transportadoraId,
-        centroCusto: draft.centroCusto,
-        ativo: draft.ativo
-      });
-      this.showVeiculoForm = true;
-      this.cdr.markForCheck();
-      return;
+  editarVeiculo(v: VeiculoListItemDTO, event?: Event): void {
+    event?.stopPropagation();
+    if (!this.veiculoForm) {
+      this.criarFormVeiculo();
     }
-
     const patchMarcaModelo = (marcaModelo: string | undefined) => {
       const s = (marcaModelo ?? '').trim();
       const idx = s.indexOf(' ');
       return idx >= 0 ? { marca: s.slice(0, idx), modelo: s.slice(idx + 1).trim() } : { marca: s, modelo: '' };
     };
+    const { marca, modelo } = patchMarcaModelo(v.marcaModelo);
+    this.veiculoEditId = v.id ?? null;
+    this.veiculoForm.patchValue({
+      id: v.id ?? null,
+      placa: v.placa ?? '',
+      motoristaId: null,
+      veiculoModeloId: null,
+      marca,
+      modelo,
+      marcaModelo: v.marcaModelo ?? '',
+      cor: v.cor ?? '',
+      anoFabricacao: v.anoFabricacao ?? null,
+      anoModelo: v.anoModelo ?? null,
+      tipoVeiculo: v.tipoVeiculo ?? '',
+      quantidadeEixos: '',
+      tipoPeso: '',
+      transportadoraId: v.transportadoraId ?? this.transportadoraId,
+      centroCusto: v.centroCusto ?? '',
+      ativo: v.ativo ?? true
+    });
+    this.modalFrotaTab = 'veiculo';
+    this.ensureTransportadoraListForFrota();
+    this.agendarAbrirModalVeiculo();
+
     this.veiculoService.obterPorId(v.id).subscribe((dto) => {
       if (dto) {
-        const { marca, modelo } = patchMarcaModelo(dto.marcaModelo);
+        const parsed = patchMarcaModelo(dto.marcaModelo);
         this.veiculoEditId = dto.id ?? null;
-        const dtoExt = dto as unknown as Record<string, unknown>;
         this.veiculoForm.patchValue({
           id: dto.id,
           placa: dto.placa,
-          condutorId: dtoExt['condutorId'] ?? null,
+          motoristaId: dto.motoristaId ?? null,
           veiculoModeloId: dto.veiculoModeloId,
-          marca,
-          modelo,
+          marca: parsed.marca,
+          modelo: parsed.modelo,
           marcaModelo: dto.marcaModelo,
           cor: dto.cor,
           anoFabricacao: dto.anoFabricacao,
           anoModelo: dto.anoModelo,
           tipoVeiculo: dto.tipoVeiculo,
-          quantidadeEixos: dtoExt['quantidadeEixos'] ?? '',
-          tipoPeso: dtoExt['tipoPeso'] ?? '',
+          quantidadeEixos: dto.quantidadeEixos != null ? String(dto.quantidadeEixos) : '',
+          tipoPeso: dto.tipoPeso ?? '',
           transportadoraId: dto.transportadoraId ?? this.transportadoraId,
           centroCusto: dto.centroCusto,
           ativo: dto.ativo
         });
-        this.ensureTransportadoraListForFrota();
-        this.showVeiculoForm = true;
+        this.aplicarVinculosMotoristasDoVeiculoDto(dto);
         this.cdr.markForCheck();
       }
+    }, () => {
+      this.toast.error('Não foi possível carregar todos os dados do veículo para edição.');
+      this.cdr.markForCheck();
     });
   }
 
   salvarVeiculo(): void {
-    if (this.veiculoForm.invalid) return;
+    if (this.veiculoForm.invalid) {
+      this.veiculoForm.markAllAsTouched();
+      return;
+    }
     const v = this.veiculoForm.value;
-    const transportadoraId = this.transportadoraId ?? v.transportadoraId;
+    const transportadoraId = this.transportadoraId;
     if (transportadoraId == null) {
-      const draftId = this.veiculoEditId != null && this.veiculoEditId <= 0 ? this.veiculoEditId : this.veiculoDraftSeq--;
-      const draft: VeiculoPendenteDraft = {
-        localId: draftId,
-        placa: (v.placa ?? '').replace(/\s/g, '').toUpperCase(),
-        condutorId: v.condutorId ?? null,
-        veiculoModeloId: v.veiculoModeloId ?? null,
-        marca: v.marca ?? '',
-        modelo: v.modelo ?? '',
-        marcaModelo: v.marcaModelo ?? '',
-        cor: v.cor ?? '',
-        anoFabricacao: v.anoFabricacao ?? null,
-        anoModelo: v.anoModelo ?? null,
-        tipoVeiculo: v.tipoVeiculo ?? '',
-        quantidadeEixos: v.quantidadeEixos ?? '',
-        tipoPeso: v.tipoPeso ?? '',
-        centroCusto: v.centroCusto ?? '',
-        ativo: v.ativo !== false
-      };
-      const draftIndex = this.veiculosPendentes.findIndex((item) => item.localId === draft.localId);
-      if (draftIndex >= 0) {
-        this.veiculosPendentes[draftIndex] = draft;
-      } else {
-        this.veiculosPendentes.push(draft);
-      }
-      this.veiculoEditId = null;
-      this.showVeiculoForm = false;
-      this.veiculos = this.mapVeiculosPendentesParaLista();
-      this.toast.success('Frota adicionada como pendente. Ela será salva junto quando a transportadora for salva.');
-      this.cdr.markForCheck();
+      this.toast.error('Salve primeiro o cadastro da transportadora para vincular a frota.');
       return;
     }
     const marcaModelo = [v.marca, v.modelo].filter(Boolean).join(' ').trim() || undefined;
+    const motoristaId =
+      v.motoristaId != null && Number(v.motoristaId) > 0 ? Number(v.motoristaId) : undefined;
     const dto: VeiculoDTO = {
-      id: v.id,
+      id: v.id && v.id > 0 ? v.id : undefined,
       transportadoraId,
       placa: (v.placa ?? '').replace(/\s/g, '').toUpperCase(),
+      motoristaId,
+      motoristaIds: this.motoristasVinculadosFrota.map((m) => m.id),
       veiculoModeloId: v.veiculoModeloId || undefined,
       marcaModelo: marcaModelo ?? v.marcaModelo,
       cor: v.cor,
@@ -812,10 +1114,12 @@ export class CadastroTransportadoraPageComponent implements OnInit {
         this.veiculoEditId = null;
         this.showVeiculoForm = false;
         this.carregarVeiculos();
+        this.toast.success(dto.id ? 'Veículo atualizado com sucesso.' : 'Veículo cadastrado com sucesso.');
         this.cdr.markForCheck();
       },
       error: () => {
         this.salvandoVeiculo = false;
+        this.toast.error('Não foi possível salvar o veículo.');
         this.cdr.markForCheck();
       }
     });
@@ -823,12 +1127,7 @@ export class CadastroTransportadoraPageComponent implements OnInit {
 
   excluirVeiculo(veiculo: VeiculoListItemDTO): void {
     if (!confirm('Excluir este veículo?')) return;
-    if (veiculo.id <= 0) {
-      this.veiculosPendentes = this.veiculosPendentes.filter((item) => item.localId !== veiculo.id);
-      this.veiculos = this.mapVeiculosPendentesParaLista();
-      this.cdr.markForCheck();
-      return;
-    }
+    if (veiculo.id <= 0) return;
     this.veiculoService.excluir(veiculo.id).subscribe({
       next: () => this.carregarVeiculos(),
       error: () => this.cdr.markForCheck()
@@ -836,8 +1135,168 @@ export class CadastroTransportadoraPageComponent implements OnInit {
   }
 
   /** Fecha o modal Cadastrar frota (Fechar, X ou clique fora). */
-  fecharModalFrota(): void {
+  fecharModalFrota(event?: Event): void {
+    if (event && Date.now() < this.bloquearFecharModalAte) {
+      return;
+    }
     this.showVeiculoForm = false;
+    this.frotaMotoristaModalAberto = false;
+    this.modalFrotaTab = 'veiculo';
+  }
+
+  setModalFrotaTab(tab: ModalFrotaTab): void {
+    this.modalFrotaTab = tab;
+    this.cdr.markForCheck();
+  }
+
+  get modalFrotaTabAtual(): ModalFrotaTab {
+    return this.modalFrotaTab === 'motoristasVinculados' ? 'motoristasVinculados' : 'veiculo';
+  }
+
+  abrirBuscaMotoristaFrota(contexto: 'veiculo' | 'vinculo' = 'veiculo'): void {
+    this.frotaMotoristaLookupContext = contexto;
+    this.frotaMotoristaModalAberto = true;
+  }
+
+  onFrotaMotoristaCampoInput(ev: Event): void {
+    const val = (ev.target as HTMLInputElement).value;
+    this.frotaMotoristaTexto = val;
+    this.veiculoForm.patchValue({ motoristaId: null }, { emitEvent: false });
+  }
+
+  onFrotaMotoristaSelecionado(item: PaginatedSearchItem): void {
+    if (this.frotaMotoristaLookupContext === 'vinculo') {
+      this.adicionarMotoristaVinculadoDaBusca(item);
+    } else {
+      this.veiculoForm.patchValue({ motoristaId: item.id });
+      this.frotaMotoristaTexto = item.titulo;
+      this.definirMotoristaPrincipal(item.id, item.titulo);
+    }
+    this.frotaMotoristaModalAberto = false;
+    this.cdr.markForCheck();
+  }
+
+  /** Termo inicial da modal conforme o contexto (aba vínculos vs. demais usos). */
+  get termoCampoModalBuscaMotorista(): string {
+    return this.frotaMotoristaLookupContext === 'vinculo' ? '' : this.frotaMotoristaTexto;
+  }
+
+  private adicionarMotoristaVinculadoDaBusca(item: PaginatedSearchItem): void {
+    const existente = this.motoristasVinculadosFrota.some((m) => m.id === item.id);
+    if (existente) {
+      this.toast.error('Este motorista já está vinculado.');
+      return;
+    }
+    const nome = (item.titulo ?? '').trim() || `Motorista ${item.id}`;
+    const semPrincipal = this.motoristasVinculadosFrota.every((m) => !m.principal);
+    this.motoristasVinculadosFrota = [...this.motoristasVinculadosFrota, { id: item.id, nome, principal: false }];
+    if (semPrincipal) {
+      this.definirMotoristaPrincipal(item.id, nome);
+    }
+  }
+
+  /** Hidrata grade de vínculos a partir do GET do veículo (listas paralelas ou motorista único). */
+  private aplicarVinculosMotoristasDoVeiculoDto(dto: VeiculoDTO): void {
+    const vinc = dto.motoristasVinculos;
+    if (vinc && vinc.length > 0) {
+      const principalId =
+        dto.motoristaId != null && vinc.some((x) => x.id === dto.motoristaId) ? dto.motoristaId! : vinc[0].id;
+      this.motoristasVinculadosFrota = vinc.map((x) => ({
+        id: x.id,
+        nome: x.nome,
+        principal: x.id === principalId
+      }));
+      const p = this.motoristasVinculadosFrota.find((m) => m.principal);
+      if (p) {
+        this.veiculoForm.patchValue({ motoristaId: p.id }, { emitEvent: false });
+        this.frotaMotoristaTexto = p.nome;
+      }
+      return;
+    }
+    this.motoristasVinculadosFrota = [];
+    this.aplicarTextoMotoristaFrota(dto);
+  }
+
+  limparMotoristaFrota(): void {
+    this.veiculoForm.patchValue({ motoristaId: null });
+    this.frotaMotoristaTexto = '';
+    this.motoristasVinculadosFrota = this.motoristasVinculadosFrota.map((m) => ({ ...m, principal: false }));
+  }
+
+  /** Preenche o texto do lookup com nome vindo do GET ou GET /Motorista/{id}. */
+  private aplicarTextoMotoristaFrota(dto: VeiculoDTO): void {
+    this.frotaMotoristaTexto = dto.motoristaNome ?? '';
+    const mid = dto.motoristaId;
+    if ((this.frotaMotoristaTexto ?? '').trim()) {
+      this.cdr.markForCheck();
+      return;
+    }
+    if (mid == null || mid <= 0) {
+      this.cdr.markForCheck();
+      return;
+    }
+    this.motoristaService.obterPorId(mid).subscribe({
+      next: (m) => {
+        this.frotaMotoristaTexto = m?.nomeCompleto ?? '';
+        this.hidratarVinculosComMotoristaPrincipal();
+        this.cdr.markForCheck();
+      },
+      error: () => this.cdr.markForCheck()
+    });
+  }
+
+  motoristaIniciais(nome: string): string {
+    const partes = String(nome ?? '')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (partes.length === 0) return 'M';
+    if (partes.length === 1) return partes[0].slice(0, 2).toUpperCase();
+    return `${partes[0][0] ?? ''}${partes[1][0] ?? ''}`.toUpperCase();
+  }
+
+  removerVinculoMotorista(id: number): void {
+    const alvo = this.motoristasVinculadosFrota.find((m) => m.id === id);
+    this.motoristasVinculadosFrota = this.motoristasVinculadosFrota.filter((m) => m.id !== id);
+    if (alvo?.principal) {
+      const novoPrincipal = this.motoristasVinculadosFrota[0];
+      if (novoPrincipal) {
+        this.definirMotoristaPrincipal(novoPrincipal.id, novoPrincipal.nome);
+      } else {
+        this.veiculoForm.patchValue({ motoristaId: null });
+        this.frotaMotoristaTexto = '';
+      }
+    }
+    this.cdr.markForCheck();
+  }
+
+  definirVinculoPrincipal(id: number): void {
+    const escolhido = this.motoristasVinculadosFrota.find((m) => m.id === id);
+    if (!escolhido) return;
+    this.definirMotoristaPrincipal(escolhido.id, escolhido.nome);
+    this.cdr.markForCheck();
+  }
+
+  private definirMotoristaPrincipal(id: number, nome: string): void {
+    this.motoristasVinculadosFrota = this.motoristasVinculadosFrota.map((m) => ({
+      ...m,
+      principal: m.id === id
+    }));
+    if (!this.motoristasVinculadosFrota.some((m) => m.id === id)) {
+      this.motoristasVinculadosFrota = [
+        ...this.motoristasVinculadosFrota,
+        { id, nome, principal: true }
+      ];
+    }
+    this.veiculoForm.patchValue({ motoristaId: id }, { emitEvent: false });
+    this.frotaMotoristaTexto = nome;
+  }
+
+  private hidratarVinculosComMotoristaPrincipal(): void {
+    const id = Number(this.veiculoForm.get('motoristaId')?.value ?? 0);
+    const nome = String(this.frotaMotoristaTexto ?? '').trim();
+    if (!id || !nome) return;
+    this.definirMotoristaPrincipal(id, nome);
   }
 
   /** Abre modal de importação de frota por Excel. */
@@ -881,102 +1340,110 @@ export class CadastroTransportadoraPageComponent implements OnInit {
     window.open('#', '_blank');
   }
 
-  // ---------- Aba Condutores (mock) ----------
-  criarFormCondutor(): void {
-    this.condutorForm = this.fb.group({
+  // ---------- Aba Motoristas ----------
+  criarFormMotorista(): void {
+    this.motoristaForm = this.fb.group({
       id: [null as number | null],
       transportadoraId: [null as number | null],
       nomeCompleto: ['', Validators.required],
       cpf: ['', Validators.required],
-      celular: [''],
       email: ['', Validators.email],
       cnh: [''],
-      categoriaCnh: [''],
       vencimentoCnh: [''],
       ativo: [true]
     });
   }
 
   abrirNovoCondutor(): void {
+    if (!this.motoristaForm) {
+      this.criarFormMotorista();
+    }
     this.condutorEditId = null;
-    this.condutorForm.reset({
+    this.motoristaForm.reset({
       id: null,
       transportadoraId: this.transportadoraId,
       nomeCompleto: '',
       cpf: '',
-      celular: '',
       email: '',
       cnh: '',
-      categoriaCnh: '',
       vencimentoCnh: '',
       ativo: true
     });
-    this.ensureTransportadoraListForFrota();
     this.showCondutorForm = true;
-    this.cdr.markForCheck();
+    this.cdr.detectChanges();
   }
 
-  /** Fecha o modal Condutor (Fechar, X ou clique fora). */
+  /** Fecha o modal Motorista (Fechar, X ou clique fora). */
   fecharModalCondutor(): void {
     this.showCondutorForm = false;
   }
 
-  salvarCondutor(): void {
-    if (this.condutorForm.invalid) return;
-    const v = this.condutorForm.value;
-    const transportadoraIdCondutor = this.transportadoraId ?? v.transportadoraId ?? undefined;
-    if (this.condutorEditId != null) {
-      const idx = this.condutoresMock.findIndex((c) => c.id === this.condutorEditId);
-      if (idx >= 0) {
-        this.condutoresMock[idx] = {
-          id: this.condutorEditId,
-          transportadoraId: transportadoraIdCondutor,
-          nomeCompleto: v.nomeCompleto,
-          cpf: v.cpf,
-          celular: v.celular,
-          email: v.email,
-          cnh: v.cnh,
-          categoriaCnh: v.categoriaCnh,
-          vencimentoCnh: v.vencimentoCnh,
-          ativo: v.ativo
-        };
-      }
-    } else {
-      const newId = Math.max(0, ...this.condutoresMock.map((c) => c.id)) + 1;
-      this.condutoresMock.push({
-        id: newId,
-        transportadoraId: transportadoraIdCondutor,
-        nomeCompleto: v.nomeCompleto,
-        cpf: v.cpf,
-        celular: v.celular,
-        email: v.email,
-        cnh: v.cnh,
-        categoriaCnh: v.categoriaCnh,
-        vencimentoCnh: v.vencimentoCnh,
-        ativo: v.ativo
-      });
+  salvarMotorista(): void {
+    if (this.motoristaForm.invalid) {
+      this.motoristaForm.markAllAsTouched();
+      return;
     }
-    this.showCondutorForm = false;
-    this.cdr.markForCheck();
+    if (this.transportadoraId == null) {
+      this.toast.error('Salve primeiro o cadastro da transportadora para vincular motoristas.');
+      return;
+    }
+    const v = this.motoristaForm.value;
+    const tid = this.transportadoraId;
+    const editSrc =
+      this.condutorEditId != null && this.condutorEditId > 0
+        ? this.condutores.find((x) => x.id === this.condutorEditId)
+        : undefined;
+    const dto: MotoristaDTO = {
+      id: this.condutorEditId != null && this.condutorEditId > 0 ? this.condutorEditId : undefined,
+      transportadoraId: tid,
+      nomeCompleto: v.nomeCompleto,
+      cpf: v.cpf,
+      email: v.email || undefined,
+      cnh: v.cnh || undefined,
+      vencimentoCnh: v.vencimentoCnh || undefined,
+      ativo: v.ativo !== false,
+      pessoaId: editSrc?.pessoaId,
+      pessoaFisicaId: editSrc?.pessoaFisicaId,
+      primeiroEnderecoId: editSrc?.primeiroEnderecoId,
+      primeiroContatoId: editSrc?.primeiroContatoId
+    };
+
+    this.salvandoMotorista = true;
+    const request$ = dto.id ? this.motoristaService.alterar(dto) : this.motoristaService.gravar(dto);
+    request$.subscribe({
+      next: () => {
+        this.salvandoMotorista = false;
+        this.showCondutorForm = false;
+        this.condutorEditId = null;
+        this.carregarCondutores();
+        this.toast.success(dto.id ? 'Motorista atualizado com sucesso.' : 'Motorista cadastrado com sucesso.');
+        this.cdr.markForCheck();
+      },
+      error: () => {
+        this.salvandoMotorista = false;
+        this.toast.error('Erro ao salvar motorista.');
+        this.cdr.markForCheck();
+      }
+    });
   }
 
-  editarCondutor(c: CondutorMock): void {
+  editarCondutor(c: MotoristaListItemDTO): void {
+    if (!this.motoristaForm) {
+      this.criarFormMotorista();
+    }
     this.condutorEditId = c.id;
-    this.condutorForm.patchValue({
+    this.motoristaForm.patchValue({
       id: c.id,
       transportadoraId: c.transportadoraId ?? null,
       nomeCompleto: c.nomeCompleto,
       cpf: c.cpf,
-      celular: c.celular,
       email: c.email,
       cnh: c.cnh,
-      categoriaCnh: c.categoriaCnh,
       vencimentoCnh: c.vencimentoCnh,
       ativo: c.ativo
     });
-    this.ensureTransportadoraListForFrota();
     this.showCondutorForm = true;
-    this.cdr.markForCheck();
+    this.cdr.detectChanges();
   }
 
   formatCpfCondutor(cpf: string): string {
@@ -998,70 +1465,42 @@ export class CadastroTransportadoraPageComponent implements OnInit {
     window.open('#', '_blank');
   }
 
-  private mapVeiculosPendentesParaLista(): VeiculoListItemDTO[] {
-    return this.veiculosPendentes.map((draft) => {
-      const marcaModelo = [draft.marca, draft.modelo].filter(Boolean).join(' ').trim() || draft.marcaModelo || '—';
-      return {
-        id: draft.localId,
-        placa: draft.placa,
-        marcaModelo,
-        cor: draft.cor || undefined,
-        anoFabricacao: draft.anoFabricacao ?? undefined,
-        anoModelo: draft.anoModelo ?? undefined,
-        tipoVeiculo: draft.tipoVeiculo || undefined,
-        centroCusto: draft.centroCusto || undefined,
-        ativo: draft.ativo,
-        transportadoraId: this.transportadoraId ?? undefined
-      };
+  carregarCondutores(): void {
+    if (this.transportadoraId == null) {
+      this.condutores = [];
+      this.loadingCondutores = false;
+      this.cdr.markForCheck();
+      return;
+    }
+    this.loadingCondutores = true;
+    this.motoristaService
+      .buscar({
+        TransportadoraId: this.transportadoraId,
+        NumeroPagina: 1,
+        TamanhoPagina: 200
+      })
+      .subscribe({
+        next: (paged) => {
+          this.condutores = paged.items;
+          this.loadingCondutores = false;
+          this.cdr.markForCheck();
+        },
+        error: () => {
+          this.condutores = [];
+          this.loadingCondutores = false;
+          this.cdr.markForCheck();
+        }
+      });
+  }
+
+  excluirCondutor(condutor: MotoristaListItemDTO): void {
+    if (!confirm('Excluir este motorista?')) return;
+    if (condutor.id <= 0) return;
+    this.motoristaService.excluir(condutor.id).subscribe({
+      next: () => this.carregarCondutores(),
+      error: () => this.toast.error('Erro ao excluir motorista.')
     });
   }
 
-  private publicarVeiculosPendentes(): void {
-    if (this.transportadoraId == null || this.veiculosPendentes.length === 0) return;
-    const pendentes = [...this.veiculosPendentes];
-    const falhas: VeiculoPendenteDraft[] = [];
-    let sucesso = 0;
-
-    const salvarProximo = (index: number): void => {
-      if (index >= pendentes.length) {
-        this.veiculosPendentes = falhas;
-        if (sucesso > 0) {
-          this.toast.success(`${sucesso} veículo(s) da frota foram salvos junto com a transportadora.`);
-        }
-        if (falhas.length > 0) {
-          this.toast.warning(`Alguns veículos (${falhas.length}) ficaram pendentes. Salve novamente para reenviar.`);
-        }
-        this.carregarVeiculos();
-        return;
-      }
-
-      const item = pendentes[index];
-      const marcaModelo = [item.marca, item.modelo].filter(Boolean).join(' ').trim() || item.marcaModelo || undefined;
-      const dto: VeiculoDTO = {
-        transportadoraId: this.transportadoraId ?? undefined,
-        placa: item.placa,
-        veiculoModeloId: item.veiculoModeloId ?? undefined,
-        marcaModelo,
-        cor: item.cor || undefined,
-        anoFabricacao: item.anoFabricacao ?? undefined,
-        anoModelo: item.anoModelo ?? undefined,
-        tipoVeiculo: item.tipoVeiculo || undefined,
-        centroCusto: item.centroCusto || undefined,
-        ativo: item.ativo
-      };
-
-      this.veiculoService.gravar(dto).subscribe({
-        next: () => {
-          sucesso += 1;
-          salvarProximo(index + 1);
-        },
-        error: () => {
-          falhas.push(item);
-          salvarProximo(index + 1);
-        }
-      });
-    };
-
-    salvarProximo(0);
-  }
 }
+

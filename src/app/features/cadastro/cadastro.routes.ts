@@ -35,11 +35,26 @@ export const CADASTRO_ROUTES: Routes = [
     ]
   },
   {
+    path: 'transportadora/editar/:id',
+    loadComponent: () =>
+      import(
+        './pages/cadastro-transportadora-page/cadastro-transportadora-page.component'
+      ).then((m) => m.CadastroTransportadoraPageComponent)
+  },
+  {
     path: 'transportadora',
     loadComponent: () =>
       import(
         './pages/cadastro-transportadora-page/cadastro-transportadora-page.component'
       ).then((m) => m.CadastroTransportadoraPageComponent)
+  },
+  {
+    path: 'motorista',
+    loadComponent: () =>
+      import(
+        './pages/cadastro-transportadora-page/cadastro-transportadora-page.component'
+      ).then((m) => m.CadastroTransportadoraPageComponent),
+    data: { forceTab: 'motoristas' }
   },
   { path: 'acessos', redirectTo: '/app/configuracoes/usuarios', pathMatch: 'full' },
   { path: 'acessos/usuarios', redirectTo: '/app/configuracoes/usuarios', pathMatch: 'full' },

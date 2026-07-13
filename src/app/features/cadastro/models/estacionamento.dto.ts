@@ -6,7 +6,7 @@ export interface PessoaDTO {
   tipoPessoa: TipoPessoa;
   nomeRazaoSocial: string;
   nomeFantasia: string;
-  documento: string;
+  cnpj: string;
   email: string;
   ativo: boolean;
 }
@@ -21,12 +21,15 @@ export interface EstacionamentoDTO {
 /** Item resumido para listagem (conforme retorno da API de listagem) */
 export interface EstacionamentoListItemDTO {
   id: number;
+  pessoaId?: number | null;
   descricao: string;
   tipoPessoa: TipoPessoa;
   nomeRazaoSocial: string;
-  documento: string;
+  cnpj: string;
   email: string;
   ativo: boolean;
+  capacidadeVeiculo?: number | null;
+  tamanhoTerreno?: string | null;
 }
 
 /** Endereço retornado em ObterPorId (pessoa.enderecos) */
@@ -57,7 +60,7 @@ export interface PessoaObterPorIdDTO {
   tipoPessoa: TipoPessoa;
   nomeRazaoSocial: string;
   nomeFantasia: string;
-  documento: string;
+  cnpj: string;
   email: string;
   ativo: boolean;
   enderecos?: EnderecoDTO[];
@@ -67,7 +70,18 @@ export interface PessoaObterPorIdDTO {
   dataAtualizacao: string | null;
 }
 
-/** Resultado bruto de GET /api/Estacionamento/ObterPorId/:id (campo result) */
+/** Contexto vindo do GET /Estacionamento/{id} para preservar datas e ids no PUT completo. */
+export interface EstacionamentoPayloadMergeContext {
+  estacionamentoDataCriacao?: string;
+  estacionamentoDataAtualizacao?: string | null;
+  /** Objeto bruto de contaBancaria da API (ou primeiro item se vier em lista; clone superficial). */
+  contaBancariaPreserved?: Record<string, unknown> | null;
+  pessoaDescricao?: string | null;
+  pessoaDataCriacao?: string;
+  pessoaDataAtualizacao?: string | null;
+}
+
+/** Resultado bruto de GET /api/Estacionamento/{id} (campo result) */
 export interface EstacionamentoObterPorIdResultDTO {
   pessoaId: number;
   capacidadeVeiculo: number;
@@ -100,9 +114,9 @@ export interface ApiResponseDTO<T> {
   result: T;
 }
 
-/** Parâmetros para GET /api/Estacionamento/Buscar (Swagger). Termo busca em id, descrição, nome/razão social, documento, e-mail, ativo. */
+/** Parâmetros para GET /api/Estacionamento?... (`Termo` é enviado como `Descricao` quando o backend não expõe `Termo` no OpenAPI). */
 export interface EstacionamentoBuscarParams {
-  /** Termo único: busca em id, descricao, nomeRazaoSocial, documento, email, ativo (backend aplica OR). */
+  /** Mapeado para `Descricao` no HttpClient. */
   Termo?: string;
   Descricao?: string;
   DataInicial?: string;

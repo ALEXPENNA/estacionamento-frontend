@@ -14,6 +14,8 @@ import { PermissionCacheService } from './permission-cache.service';
 import { SessionAccessService, SessionMenuAccess } from './session-access.service';
 import { environment } from '../../../environments/environment';
 import { ApiError } from '../api/models';
+import { mergeServiceResultToRoot, readLoginServiceFailure } from '../api/utils/service-result.util';
+import { getLoginMenusAppRouteValidationMessage } from '../utils/login-menus-app-route.validator';
 
 export interface LoginRequest {
   userName: string;
@@ -68,7 +70,19 @@ export class AuthService {
 
     const url = `${environment.API_BASE_URL}/auth/Usuario/Login`;
     return this.http.post<LoginResponse>(url, body).pipe(
-      map((res): LoginResult => this.buildSessionFromLoginResponse(username, res)),
+      map((res): LoginResult => {
+        if (res && typeof res === 'object') {
+          const fail = readLoginServiceFailure(res);
+          if (fail) {
+            return fail;
+          }
+        }
+        const merged =
+          res && typeof res === 'object'
+            ? (mergeServiceResultToRoot(res as Record<string, unknown>) as unknown as LoginResponse)
+            : res;
+        return this.buildSessionFromLoginResponse(username, merged);
+      }),
       catchError((err: unknown) => {
         const message = this.getLoginErrorMessage(err);
         return of({ success: false, message });
@@ -192,7 +206,13 @@ export class AuthService {
     const permissionKeys = extractJwtPermissionKeys(payload);
     this.permissionCache.setKeys(permissionKeys);
     const jwtRole = resolveJwtRole(payload);
-    this.sessionAccess.setMenus(extractMenusFromLoginBody(res, jwtRole));
+    const menusFromLogin = extractMenusFromLoginBody(res, jwtRole);
+    const rotaInvalidaMsg = getLoginMenusAppRouteValidationMessage(menusFromLogin);
+    if (rotaInvalidaMsg) {
+      this.permissionCache.clear();
+      return { success: false, message: rotaInvalidaMsg };
+    }
+    this.sessionAccess.setMenus(menusFromLogin);
     if (this.sessionAccess.hasSessionMenus() && !this.sessionAccess.getDefaultRoute()) {
       this.permissionCache.clear();
       this.sessionAccess.clear();

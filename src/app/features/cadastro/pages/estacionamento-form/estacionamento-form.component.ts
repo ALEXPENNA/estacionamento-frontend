@@ -1,7 +1,24 @@
-import { ChangeDetectorRef, Component, NgZone, OnInit, OnDestroy, inject, DestroyRef } from '@angular/core';
+import {
+  ChangeDetectorRef,
+  Component,
+  NgZone,
+  OnInit,
+  OnDestroy,
+  inject,
+  DestroyRef,
+  isDevMode
+} from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
-import { Subscription, combineLatest } from 'rxjs';
-import { debounceTime, distinctUntilChanged, filter, switchMap } from 'rxjs';
+import {
+  Subscription,
+  combineLatest,
+  debounceTime,
+  distinctUntilChanged,
+  filter,
+  finalize,
+  map,
+  switchMap
+} from 'rxjs';
 import { startWith } from 'rxjs/operators';
 import { CommonModule } from '@angular/common';
 import {
@@ -9,35 +26,52 @@ import {
   FormBuilder,
   FormGroup,
   FormArray,
-  Validators
+  Validators,
+  AbstractControl,
+  ValidationErrors,
+  ValidatorFn
 } from '@angular/forms';
-import { Router, ActivatedRoute, RouterLink } from '@angular/router';
-import { EstacionamentoService } from '../../services/estacionamento.service';
+import { Router, ActivatedRoute } from '@angular/router';
+import { EstacionamentoService, type EstacionamentoFormValue } from '../../services/estacionamento.service';
 import { EstacionamentoFotosService, type FotoItem } from '../../services/estacionamento-fotos.service';
 import { ViacepService } from '../../services/viacep.service';
 import { EstacionamentoFormStepService } from '../../services/estacionamento-form-step.service';
 import { ToastService } from '../../../../core/api/services/toast.service';
+import type { ApiError } from '../../../../core/api/models/api-error.model';
 import { documentoValidator } from '../../validators/documento.validator';
-import { TipoPessoa } from '../../models/estacionamento.dto';
-import { CnpjFormatDirective, formatCnpj } from '../../directives/cnpj-format.directive';
+import { TipoPessoa, type EstacionamentoPayloadMergeContext } from '../../models/estacionamento.dto';
+import { CnpjFormatDirective, formatCnpj as formatCnpjDigits } from '../../directives/cnpj-format.directive';
 import { CpfFormatDirective, formatCpf } from '../../directives/cpf-format.directive';
 import { TelefoneFormatDirective, formatTelefone } from '../../directives/telefone-format.directive';
-import { formValueToEstacionamentoPayload } from './estacionamento-form.mapper';
+import {
+  formValueToEstacionamentoPayload,
+  montarPayloadSalvarAbaDadosBancarios,
+  extrairContaBancariaDaRespostaApi,
+  contaBancariaRegistroComDadosRelevantes,
+  type FormValue
+} from './estacionamento-form.mapper';
 import { BANCOS_BRASIL, bancoToOption } from '../../data/bancos-brasil';
-import { CnpjBrasilApiService } from '../../services/cnpj-brasilapi.service';
 import { CnpjFormValue } from '../../models/brasilapi-cnpj.model';
-import { validarCnpj, cnpjTem14Digitos } from '../../utils/cnpj.utils';
+import { CnpjLookupResult, CnpjService } from '../../services/cnpj.service';
 
 const MAX_FOTOS = 4;
 const MAX_CONTATOS_COMPLEMENTARES = 5;
 
+/** Telefone do responsável: mínimo de dígitos (com DDD). */
+function telefoneContatoMinDigitosValidator(minDigitos = 10): ValidatorFn {
+  return (control: AbstractControl): ValidationErrors | null => {
+    const d = String(control.value ?? '').replace(/\D/g, '');
+    if (!d.length) return null;
+    return d.length >= minDigitos ? null : { telefoneContato: { min: minDigitos, atual: d.length } };
+  };
+}
+
 @Component({
-  selector: 'app-estacionamento-form',
+  selector: 'app-Estacionamento-form',
   standalone: true,
   imports: [
     CommonModule,
     ReactiveFormsModule,
-    RouterLink,
     CnpjFormatDirective,
     CpfFormatDirective,
     TelefoneFormatDirective
@@ -50,7 +84,10 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
   id: number | null = null;
   loading = false;
   salvando = false;
+  /** Somente botão Salvar da aba Dados Bancários (edição). */
+  salvandoDadosBancarios = false;
   erro: string | null = null;
+  errosCamposSalvar: string[] = [];
   /** Accordion "Dados complementares": inicia fechado. */
   complementaresOpen = false;
   /** Accordion "Contatos (Responsável legal e complementares)": inicia fechado. */
@@ -60,6 +97,8 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
   contratoPdfError: string | null = null;
   /** Endereços retornados por ObterPorId; preservados no payload ao alterar. */
   loadedEnderecos: Record<string, unknown>[] = [];
+  /** Merge do GET (datas, conta bruta) para PUT completo sem perder auditoria/ids. */
+  private payloadMerge: EstacionamentoPayloadMergeContext | null = null;
   /** Fotos do backend (listar/upload/deletar via API Azure). Máximo 4. */
   fotoItems: FotoItem[] = [];
   fotoError: string | null = null;
@@ -76,20 +115,22 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
   /** True se o backend não expõe endpoint para definir foto principal após envio (apenas PadraoIndex no upload). */
   readonly endpointPrincipalFalta = true;
 
-  /** Mesma consulta da tela Transportadora: BrasilAPI direta (`CnpjBrasilApiService.buscar`). */
+  /** Consulta de CNPJ unificada (via `CnpjService`) com tratamento de timeout/erros por status. */
   cnpjLoading = false;
   cnpjError: string | null = null;
+  cnpjSuccess: string | null = null;
+  private ultimoCnpjConsultado = '';
 
   private stepService = inject(EstacionamentoFormStepService);
   private destroyRef = inject(DestroyRef);
-  private cnpjBrasilApi = inject(CnpjBrasilApiService);
+  private cnpjService = inject(CnpjService);
   private titularSyncSub?: Subscription;
 
   constructor(
     private fb: FormBuilder,
     private router: Router,
     private route: ActivatedRoute,
-    private estacionamentoService: EstacionamentoService,
+    private EstacionamentoService: EstacionamentoService,
     private fotosService: EstacionamentoFotosService,
     private viacep: ViacepService,
     private toast: ToastService,
@@ -113,16 +154,94 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
     return this.stepService.currentStep();
   }
 
+  /**
+   * Campos obrigatórios da etapa Cadastro ainda incorretos ou vazios (painel lateral).
+   * Espelha validadores do formulário; em criação, inclui endereço principal como em `validarCamposMinimosCriacao`.
+   */
+  get cadastroObrigatoriosPendentesLabels(): string[] {
+    if (!this.form) return [];
+    const p: string[] = [];
+    if (this.form.get('pessoa.cnpj')?.invalid) p.push('CNPJ');
+    if (this.form.get('pessoa.nomeRazaoSocial')?.invalid) p.push('Razão social');
+    if (this.form.get('responsavelLegalNome')?.invalid) p.push('Nome do responsável legal');
+    if (this.form.get('responsavelLegalCpf')?.invalid) p.push('CPF do responsável legal');
+    if (this.form.get('responsavelLegalEmail')?.invalid) p.push('E-mail do responsável legal');
+    if (this.form.get('contatoTelefone')?.invalid) p.push('Telefone de contato');
+    if (this.isNovo) {
+      p.push(...this.pendenciasEnderecoPrincipalNovo());
+    }
+    return p;
+  }
+
+  /** Regras de endereço principal na criação (alinhado a `validarCamposMinimosCriacao`). */
+  private pendenciasEnderecoPrincipalNovo(): string[] {
+    const out: string[] = [];
+    if (this.enderecosArray.length === 0) {
+      out.push('Endereço principal');
+      return out;
+    }
+    const principal =
+      (this.enderecosArray.controls.find(
+        (ctrl) => Boolean((ctrl as FormGroup).get('principal')?.value)
+      ) as FormGroup | undefined) ?? (this.enderecosArray.at(0) as FormGroup);
+    const getValue = (key: string) => String(principal.get(key)?.value ?? '').trim();
+    if (!getValue('cep')) out.push('CEP do endereço principal');
+    if (!getValue('logradouro')) out.push('Logradouro do endereço principal');
+    if (!getValue('numero')) out.push('Número do endereço principal');
+    if (!getValue('bairro')) out.push('Bairro do endereço principal');
+    if (!getValue('cidade')) out.push('Cidade do endereço principal');
+    if (!getValue('estado')) out.push('UF do endereço principal');
+    return out;
+  }
+
+  /** Progresso do preenchimento da aba Cadastro (0–100) para o painel lateral. */
+  get cadastroFillProgressPercent(): number {
+    if (!this.form) return 0;
+    const f = this.form;
+    let ok = 0;
+    const total = 10;
+    const doc = String(f.get('pessoa.cnpj')?.value ?? '').replace(/\D/g, '');
+    if (doc.length === 14) ok++;
+    if (String(f.get('pessoa.nomeRazaoSocial')?.value ?? '').trim().length >= 2) ok++;
+    if (String(f.get('responsavelLegalNome')?.value ?? '').trim().length >= 2) ok++;
+    const cpf = String(f.get('responsavelLegalCpf')?.value ?? '').replace(/\D/g, '');
+    if (cpf.length === 11) ok++;
+    const email = String(f.get('responsavelLegalEmail')?.value ?? '').trim();
+    if (email.length > 3 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) ok++;
+    const tel = String(f.get('contatoTelefone')?.value ?? '').replace(/\D/g, '');
+    if (tel.length >= 10) ok++;
+    if (String(f.get('pessoa.nomeFantasia')?.value ?? '').trim().length > 0) ok++;
+    const enderecos = this.enderecosArray;
+    if (enderecos.length > 0) {
+      const eg = enderecos.at(0) as FormGroup;
+      const cep = String(eg?.get('cep')?.value ?? '').replace(/\D/g, '');
+      const log = String(eg?.get('logradouro')?.value ?? '').trim();
+      const cid = String(eg?.get('cidade')?.value ?? '').trim();
+      if (cep.length >= 8 && log.length >= 2 && cid.length >= 2) ok += 3;
+    }
+    return Math.min(100, Math.round((ok / total) * 100));
+  }
+
+  resumoCnpjFormatado(): string {
+    const raw = String(this.form?.get('pessoa.cnpj')?.value ?? '');
+    return formatCnpjDigits(raw);
+  }
+
   ngOnInit(): void {
+    this.stepService.onSaveFromHeader$
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe(() => this.executarSalvarDoCabecalho());
+
     const idParam = this.route.snapshot.paramMap.get('id');
     this.id = idParam ? +idParam : null;
     this.criarFormulario();
     if (this.id) {
       this.stepService.reset(); // edição: tudo na mesma tela, step 1 para estado consistente
-      this.carregar();
+      this.carregarEstacionamentoPorId();
     } else {
+      this.payloadMerge = null;
       this.stepService.reset();
-      this.atualizarValidadoresDocumento();
+      this.atualizarValidadoresCnpj();
     }
   }
 
@@ -137,15 +256,15 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
   private criarFormulario(): void {
     this.form = this.fb.group({
       id: [0],
-      descricao: ['', [Validators.required, Validators.minLength(2)]],
       pessoaId: [0],
       pessoa: this.fb.group({
         id: [0],
         tipoPessoa: [2 as TipoPessoa, Validators.required], // apenas PJ
         nomeRazaoSocial: ['', [Validators.required, Validators.minLength(2)]],
         nomeFantasia: [''],
-        documento: ['', [Validators.required]],
-        email: ['', [Validators.required, Validators.email]],
+        cnpj: ['', [Validators.required]],
+        /** Espelha o e-mail do responsável legal para o payload `pessoa.email` (contrato API). */
+        email: [''],
         ativo: [true]
       }),
       // Dados complementares: Estrutura, Valores, Localização
@@ -161,10 +280,10 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
       // Endereços (lista para o backend)
       enderecos: this.fb.array([]),
       // Contatos (accordion): responsável legal + até 5 contatos complementares (FormArray)
-      responsavelLegalNome: [''],
-      responsavelLegalCpf: [''],
-      responsavelLegalEmail: ['', [Validators.email]],
-      contatoTelefone: [''],
+      responsavelLegalNome: ['', [Validators.required, Validators.minLength(2)]],
+      responsavelLegalCpf: ['', [Validators.required, documentoValidator(1 as TipoPessoa)]],
+      responsavelLegalEmail: ['', [Validators.required, Validators.email]],
+      contatoTelefone: ['', [Validators.required, telefoneContatoMinDigitosValidator(10)]],
       contatosComplementares: this.fb.array([]),
       contrato: [''],
       // Dados bancários (passo 2 - novo cadastro): agência e conta com número + dígito
@@ -183,71 +302,103 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
     this.setupTaxaMensalidadeToggle();
     this.setupTitularBancarioSync();
     this.setupCnpjBusca();
+    this.setupEmailResponsavelParaPessoa();
+  }
+
+  /** Mantém `pessoa.email` alinhado ao e-mail do responsável (campo exibido na UI). */
+  private setupEmailResponsavelParaPessoa(): void {
+    const resp = this.form.get('responsavelLegalEmail');
+    const pessoaEmail = this.form.get('pessoa.email');
+    if (!resp || !pessoaEmail) return;
+    resp.valueChanges.pipe(startWith(resp.value), takeUntilDestroyed(this.destroyRef)).subscribe((v) => {
+      const s = typeof v === 'string' ? v.trim() : '';
+      pessoaEmail.setValue(s, { emitEvent: false });
+    });
   }
 
   /**
-   * Busca automática por CNPJ (BrasilAPI), igual ao cadastro de transportadora:
-   * debounce no campo `pessoa.documento` e blur; preenche só campos vazios.
+   * Busca automática por CNPJ com debounce, distinct e cancelamento.
+   * Mantém blur como reforço, sem botão dedicado.
    */
   private setupCnpjBusca(): void {
-    const docControl = this.form.get('pessoa.documento');
+    const docControl = this.form.get('pessoa.cnpj');
     if (!docControl) return;
     docControl.valueChanges
       .pipe(
-        debounceTime(500),
+        map((v) => this.cnpjService.normalizeCnpj(v)),
+        debounceTime(700),
         distinctUntilChanged(),
-        filter((v) => cnpjTem14Digitos(v) && validarCnpj(v)),
+        filter((v) => v.length > 0),
         switchMap((v) => {
           this.cnpjLoading = true;
           this.cnpjError = null;
+          this.cnpjSuccess = null;
           this.cdr.markForCheck();
-          return this.cnpjBrasilApi.buscar(v);
+          return this.cnpjService.consultarCnpj(v);
         }),
         takeUntilDestroyed(this.destroyRef)
       )
       .subscribe({
-        next: (res) => {
+        next: (result) => {
           this.cnpjLoading = false;
-          if (res == null) {
-            this.cnpjError = 'CNPJ não encontrado.';
-          } else {
-            this.cnpjError = null;
-            this.applyCnpjBrasilApiToForm(res);
-          }
+          this.handleConsultaCnpjResult(result);
           this.cdr.markForCheck();
         },
         error: () => {
           this.cnpjLoading = false;
-          this.cnpjError = 'Não foi possível buscar os dados do CNPJ.';
+          this.cnpjError = 'Não foi possível consultar os dados do CNPJ no momento.';
+          this.cnpjSuccess = null;
           this.cdr.markForCheck();
         }
       });
   }
 
   /** Dispara busca ao sair do CNPJ (evita depender só do debounce). */
-  onDocumentoCnpjBlur(): void {
-    const cnpj = this.form.get('pessoa.documento')?.value ?? '';
-    if (!cnpjTem14Digitos(cnpj) || !validarCnpj(cnpj) || this.cnpjLoading) return;
+  onCnpjBlur(): void {
+    const docControl = this.form.get('pessoa.cnpj');
+    docControl?.markAsTouched();
+    const cnpj = docControl?.value ?? '';
+    const normalized = this.cnpjService.normalizeCnpj(cnpj);
+    if (this.cnpjLoading || !normalized) return;
+    if (normalized === this.ultimoCnpjConsultado && !this.cnpjError) return;
     this.cnpjLoading = true;
     this.cnpjError = null;
+    this.cnpjSuccess = null;
     this.cdr.markForCheck();
-    this.cnpjBrasilApi.buscar(cnpj).subscribe({
-      next: (res) => {
+    this.cnpjService.consultarCnpj(normalized).subscribe({
+      next: (result) => {
         this.cnpjLoading = false;
-        if (res == null) {
-          this.cnpjError = 'CNPJ não encontrado.';
-        } else {
-          this.cnpjError = null;
-          this.applyCnpjBrasilApiToForm(res);
-        }
+        this.handleConsultaCnpjResult(result);
         this.cdr.markForCheck();
       },
       error: () => {
         this.cnpjLoading = false;
-        this.cnpjError = 'Não foi possível buscar os dados do CNPJ.';
+        this.cnpjError = 'Não foi possível consultar os dados do CNPJ no momento.';
+        this.cnpjSuccess = null;
         this.cdr.markForCheck();
       }
     });
+  }
+
+  private handleConsultaCnpjResult(result: CnpjLookupResult): void {
+    this.ultimoCnpjConsultado = result.normalizedCnpj;
+    this.cnpjError = null;
+    this.cnpjSuccess = null;
+
+    if (result.status === 'success' && result.data) {
+      this.applyCnpjBrasilApiToForm(result.data);
+      this.cnpjSuccess = result.message;
+      return;
+    }
+
+    if (result.status !== 'incomplete') {
+      this.cnpjError = result.message;
+      return;
+    }
+
+    if (this.form.get('pessoa.cnpj')?.touched) {
+      this.cnpjError = result.message;
+    }
   }
 
   private applyCnpjBrasilApiToForm(value: CnpjFormValue): void {
@@ -261,24 +412,17 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
     if (value.nomeFantasia && isEmpty(pessoa.get('nomeFantasia')?.value)) {
       pessoa.get('nomeFantasia')?.setValue(value.nomeFantasia, { emitEvent: false });
     }
-    pessoa.get('ativo')?.setValue(value.ativo, { emitEvent: false });
-    if (value.email?.trim() && isEmpty(pessoa.get('email')?.value)) {
-      pessoa.get('email')?.setValue(value.email.trim(), { emitEvent: false });
+    const ativoControl = pessoa.get('ativo');
+    if (ativoControl?.pristine) {
+      ativoControl.setValue(value.ativo, { emitEvent: false });
+    }
+    const emailCnpj = value.email?.trim();
+    if (emailCnpj && isEmpty(this.form.get('responsavelLegalEmail')?.value)) {
+      this.form.get('responsavelLegalEmail')?.setValue(emailCnpj, { emitEvent: true });
     }
     const telDigits = (value.telefone ?? '').replace(/\D/g, '');
     if (telDigits.length >= 10 && isEmpty(this.form.get('contatoTelefone')?.value)) {
       this.form.get('contatoTelefone')?.setValue(formatTelefone(telDigits), { emitEvent: false });
-    }
-
-    const desc = this.form.get('descricao');
-    if (desc && isEmpty(desc.value)) {
-      const nome =
-        (value.nomeFantasia && value.nomeFantasia.trim()) ||
-        (value.razaoSocial && value.razaoSocial.trim()) ||
-        '';
-      if (nome) {
-        desc.setValue(nome, { emitEvent: false });
-      }
     }
 
     if (value.endereco) {
@@ -360,7 +504,7 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
   private setupTitularBancarioSync(): void {
     const pessoa = this.form.get('pessoa');
     const razao = pessoa?.get('nomeRazaoSocial');
-    const doc = pessoa?.get('documento');
+    const doc = pessoa?.get('cnpj');
     const titularMesmo = this.form.get('titularMesmoResponsavel');
     if (!razao || !doc || !titularMesmo) return;
     const sub = new Subscription();
@@ -388,7 +532,7 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
   private syncTitularFromPessoa(): void {
     const pessoa = this.form.get('pessoa');
     const razao = pessoa?.get('nomeRazaoSocial')?.value ?? '';
-    const doc = pessoa?.get('documento')?.value ?? '';
+    const doc = pessoa?.get('cnpj')?.value ?? '';
     this.form.patchValue({
       titularRazaoSocial: razao,
       titularCnpj: doc
@@ -430,37 +574,189 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
   get titularCnpjFormatted(): string {
     const raw = this.form.get('titularCnpj')?.value ?? '';
     const digits = String(raw).replace(/\D/g, '');
-    return digits.length === 14 ? formatCnpj(digits) : raw;
+    return digits.length === 14 ? formatCnpjDigits(digits) : raw;
   }
 
-  private atualizarValidadoresDocumento(): void {
-    const doc = this.form.get('pessoa.documento');
+  /** Validação só dos campos da aba Dados Bancários (titular diferente). */
+  get bankTabInvalid(): boolean {
+    if (this.currentStep !== 2) return false;
+    if (this.form.get('titularMesmoResponsavel')?.value === false) {
+      return !!(
+        this.form.get('titularRazaoSocial')?.invalid ||
+        this.form.get('titularCnpj')?.invalid
+      );
+    }
+    return false;
+  }
+
+  /** GET por id — recarrega apenas campos exibidos em Dados Bancários após salvar. */
+  carregarDadosBancarios(): void {
+    if (this.id == null) return;
+    this.EstacionamentoService.obterPorId(this.id).subscribe({
+      next: (dto) => {
+        this.ngZone.run(() => {
+          if (dto) {
+            this.payloadMerge = dto.payloadMerge ?? null;
+            this.aplicarDadosBancariosDoDto(dto);
+            this.atualizarFlagsTitularDoDto(dto);
+          }
+          this.cdr.markForCheck();
+        });
+      },
+      error: () => {
+        this.toast.error('Não foi possível recarregar os dados bancários.');
+      }
+    });
+  }
+
+  /**
+   * Persiste dados bancários com PUT /api/Estacionamento no mesmo body completo do estacionamento
+   * (`contaBancaria` atualizado a partir do formulário + merge do GET).
+   * Cadastro novo sem id: delega a `salvarCadastroEstacionamento` (POST completo).
+   */
+  salvarDadosBancarios(): void {
+    if (this.salvandoDadosBancarios || this.salvando) return;
+    if (this.bankTabInvalid) {
+      this.form.get('titularRazaoSocial')?.markAsTouched();
+      this.form.get('titularCnpj')?.markAsTouched();
+      this.toast.warning('Verifique os dados do titular da conta.');
+      return;
+    }
+    if (this.id == null || this.id <= 0) {
+      this.salvarCadastroEstacionamento(true);
+      return;
+    }
+    if (this.form.get('titularMesmoResponsavel')?.value) {
+      this.syncTitularFromPessoa();
+    }
+    const raw = this.form.getRawValue() as FormValue;
+    const payload = montarPayloadSalvarAbaDadosBancarios(raw, this.loadedEnderecos, this.payloadMerge, this.id);
+    const contaPayloadRaw = payload['contaBancaria'] as unknown;
+    const primeiraConta = Array.isArray(contaPayloadRaw)
+      ? contaPayloadRaw[0]
+      : contaPayloadRaw;
+    if (!contaBancariaRegistroComDadosRelevantes(primeiraConta)) {
+      this.toast.warning('Preencha ao menos um campo de dados bancários.');
+      return;
+    }
+    if (isDevMode()) {
+      console.log('[Estacionamento] PUT dados bancários — payload completo', payload);
+    }
+    this.salvandoDadosBancarios = true;
+    this.erro = null;
+    this.errosCamposSalvar = [];
+    this.EstacionamentoService.alterar(payload)
+      .pipe(
+        switchMap(() => this.EstacionamentoService.obterPorIdDetalhado(this.id!)),
+        finalize(() => {
+          this.salvandoDadosBancarios = false;
+          this.cdr.markForCheck();
+        })
+      )
+      .subscribe({
+        next: ({ dto, raw }) => {
+          if (isDevMode()) {
+            console.log('[Estacionamento] GET após PUT — contaBancaria', extrairContaBancariaDaRespostaApi(raw));
+          }
+          const lista = extrairContaBancariaDaRespostaApi(raw);
+          const primeira = lista[0];
+          const persistiu =
+            lista.length > 0 && contaBancariaRegistroComDadosRelevantes(primeira);
+          if (!dto || !persistiu) {
+            this.toast.error(
+              'Dados enviados, mas não foram persistidos. Verifique o payload de contaBancaria.'
+            );
+            return;
+          }
+          this.payloadMerge = dto.payloadMerge ?? null;
+          this.aplicarDadosBancariosDoDto(dto);
+          this.atualizarFlagsTitularDoDto(dto);
+          this.toast.success('Dados bancários salvos com sucesso.');
+        },
+        error: (err: unknown) => {
+          const status = this.extractApiError(err)?.status;
+          const fallback =
+            status === 400
+              ? 'Não foi possível salvar. Verifique os dados bancários.'
+              : status === 0
+                ? 'Sem conexão com o servidor.'
+                : 'Não foi possível salvar os dados bancários. Tente novamente.';
+          const msg = this.extractApiMessage(err, fallback);
+          const fieldErrors = this.extractApiFieldErrors(err);
+          this.erro = msg;
+          this.errosCamposSalvar = fieldErrors;
+          this.toast.error(fieldErrors.length > 0 ? `${msg} ${fieldErrors[0]}` : msg);
+        }
+      });
+  }
+
+  private aplicarDadosBancariosDoDto(dto: EstacionamentoFormValue): void {
+    const trim = (s: string | null | undefined) => (s == null ? '' : String(s).trim());
+    this.form.patchValue({
+      banco: trim(dto.banco),
+      ...this.parseAgenciaContaDoDto(trim(dto.agencia ?? ''), trim(dto.conta ?? '')),
+      tipoConta: trim(dto.tipoConta),
+      chavePix: trim(dto.chavePix),
+      contaBancariaId: dto.contaBancariaId ?? null,
+      titularRazaoSocial: trim(dto.titularRazaoSocial ?? ''),
+      titularCnpj: trim(dto.titularCnpj ?? '')
+    });
+    this.bancoFiltro = this.form.get('banco')?.value ?? '';
+    const tipoContaVal = this.form.get('tipoConta')?.value ?? '';
+    const tipoContaOp = this.tipoContaOpcoes.find((o) => o.value === tipoContaVal);
+    this.tipoContaFiltro = tipoContaOp ? tipoContaOp.label : '';
+  }
+
+  private atualizarFlagsTitularDoDto(dto: EstacionamentoFormValue): void {
+    const trim = (s: string | null | undefined) => (s == null ? '' : String(s).trim());
+    const titularDto = trim(dto.titularRazaoSocial ?? '');
+    const titularCnpjDto = trim(dto.titularCnpj ?? '');
+    const pessoaRazao = trim(dto.pessoa.nomeRazaoSocial ?? '');
+    const pessoaCnpj = String(dto.pessoa.cnpj ?? (dto.pessoa as { documento?: string }).documento ?? '').replace(/\D/g, '');
+    const titularCnpjDigits = titularCnpjDto.replace(/\D/g, '');
+    const titularDiferente = Boolean(
+      titularDto &&
+      ((titularDto.toLowerCase() !== pessoaRazao.toLowerCase()) || (titularCnpjDigits && titularCnpjDigits !== pessoaCnpj))
+    );
+    if (titularDiferente) {
+      this.form.patchValue({ titularMesmoResponsavel: false }, { emitEvent: false });
+      this.atualizarValidadoresTitular(false);
+    } else {
+      this.form.patchValue({ titularMesmoResponsavel: true }, { emitEvent: false });
+      this.syncTitularFromPessoa();
+      this.atualizarValidadoresTitular(true);
+    }
+  }
+
+  private atualizarValidadoresCnpj(): void {
+    const doc = this.form.get('pessoa.cnpj');
     doc?.clearValidators();
     doc?.addValidators([Validators.required, documentoValidator(2 as TipoPessoa)]); // CNPJ
     doc?.updateValueAndValidity();
   }
 
-  private carregar(): void {
+  carregarEstacionamentoPorId(): void {
     if (this.id == null) return;
     this.loading = true;
     this.erro = null;
-    this.estacionamentoService.obterPorId(this.id).subscribe({
+    this.EstacionamentoService.obterPorId(this.id).subscribe({
       next: (dto) => {
         this.ngZone.run(() => {
           if (dto) {
+            this.payloadMerge = dto.payloadMerge ?? null;
             this.loadedEnderecos = (dto.enderecos ?? []).map((e) => ({ ...e })) as Record<string, unknown>[];
             this.preencherEnderecosDoDto((dto.enderecos ?? []) as unknown as Record<string, unknown>[]);
             const trim = (s: string | null | undefined) => (s == null ? '' : String(s).trim());
             const cpfRaw = (dto.responsavelLegalCpf ?? '').replace(/\D/g, '');
             const telRaw = (dto.contatoTelefone ?? '').replace(/\D/g, '');
             const tamanhoNum = dto.tamanho != null && dto.tamanho !== '' ? Number(dto.tamanho) : null;
+            const emailRespDto = trim(dto.responsavelLegalEmail ?? '');
             this.form.patchValue({
               id: dto.id,
-              descricao: trim(dto.descricao),
               pessoaId: dto.pessoaId,
               responsavelLegalNome: dto.responsavelLegalNome,
               responsavelLegalCpf: cpfRaw.length === 11 ? formatCpf(cpfRaw) : trim(dto.responsavelLegalCpf),
-              responsavelLegalEmail: trim(dto.responsavelLegalEmail ?? ''),
+              responsavelLegalEmail: emailRespDto || trim(dto.pessoa.email),
               contatoTelefone: telRaw.length >= 10 ? formatTelefone(telRaw) : trim(dto.contatoTelefone),
               capacidadeVeiculos: dto.capacidadeVeiculos,
               tamanho: tamanhoNum,
@@ -470,56 +766,27 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
               taxaPercentual: dto.taxaPercentual,
               mensalidadeValor: dto.mensalidadeValor,
               latitude: dto.latitude ?? null,
-              longitude: dto.longitude ?? null,
-              banco: trim(dto.banco),
-              ...this.parseAgenciaContaDoDto(trim(dto.agencia ?? ''), trim(dto.conta ?? '')),
-              tipoConta: trim(dto.tipoConta),
-              chavePix: trim(dto.chavePix),
-              contaBancariaId: dto.contaBancariaId ?? null,
-              titularRazaoSocial: trim(dto.titularRazaoSocial ?? ''),
-              titularCnpj: trim(dto.titularCnpj ?? '')
+              longitude: dto.longitude ?? null
             });
-            // Sincronizar estado dos combos com os dados carregados (exibição ao editar)
-            this.bancoFiltro = this.form.get('banco')?.value ?? '';
-            const tipoContaVal = this.form.get('tipoConta')?.value ?? '';
-            const tipoContaOp = this.tipoContaOpcoes.find((o) => o.value === tipoContaVal);
-            this.tipoContaFiltro = tipoContaOp ? tipoContaOp.label : '';
-            if (this.form.get('titularMesmoResponsavel')?.value === true) {
-              this.syncTitularFromPessoa();
-            }
             this.fotoItems = [];
             this.carregarFotos();
+            const emailPessoaCarregado = trim(dto.pessoa.email);
             this.form.get('pessoa')?.patchValue({
               id: dto.pessoa.id,
               tipoPessoa: dto.pessoa.tipoPessoa ?? 2,
               nomeRazaoSocial: trim(dto.pessoa.nomeRazaoSocial),
               nomeFantasia: trim(dto.pessoa.nomeFantasia),
-              email: trim(dto.pessoa.email),
+              email: emailRespDto || emailPessoaCarregado,
               ativo: dto.pessoa.ativo ?? true,
-              documento: (dto.pessoa.documento ?? '').replace(/\s/g, '')
+              cnpj: (dto.pessoa.cnpj ?? (dto.pessoa as { documento?: string }).documento ?? '').replace(/\s/g, '')
             });
-            const titularDto = trim(dto.titularRazaoSocial ?? '');
-            const titularCnpjDto = trim(dto.titularCnpj ?? '');
-            const pessoaRazao = trim(dto.pessoa.nomeRazaoSocial ?? '');
-            const pessoaCnpj = String(dto.pessoa.documento ?? '').replace(/\D/g, '');
-            const titularCnpjDigits = titularCnpjDto.replace(/\D/g, '');
-            const titularDiferente = Boolean(
-              titularDto &&
-              ((titularDto.toLowerCase() !== pessoaRazao.toLowerCase()) || (titularCnpjDigits && titularCnpjDigits !== pessoaCnpj))
-            );
-            if (titularDiferente) {
-              this.form.patchValue({ titularMesmoResponsavel: false }, { emitEvent: false });
-              this.atualizarValidadoresTitular(false);
-            } else {
-              this.form.patchValue({ titularMesmoResponsavel: true }, { emitEvent: false });
-              this.syncTitularFromPessoa();
-              this.atualizarValidadoresTitular(true);
-            }
-            const doc = this.form.get('pessoa.documento')?.value;
+            this.aplicarDadosBancariosDoDto(dto);
+            this.atualizarFlagsTitularDoDto(dto);
+            const doc = this.form.get('pessoa.cnpj')?.value;
             if (doc != null && String(doc).replace(/\D/g, '').length === 14) {
-              this.form.get('pessoa')?.patchValue({ documento: formatCnpj(String(doc)) });
+              this.form.get('pessoa')?.patchValue({ cnpj: formatCnpjDigits(String(doc)) });
             }
-            this.atualizarValidadoresDocumento();
+            this.atualizarValidadoresCnpj();
             if (dto.capacidadeVeiculos != null || dto.tamanho || dto.tipoTaxaMensalidade ||
                 dto.possuiSeguranca || dto.possuiBanheiro || dto.latitude != null || dto.longitude != null) {
               this.complementaresOpen = true;
@@ -550,11 +817,37 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
     });
   }
 
+  /** Enter no formulário: na aba Dados Bancários dispara o salvamento exclusivo da conta. */
+  onFormSubmit(event: Event): void {
+    event.preventDefault();
+    if (this.currentStep === 2) {
+      this.salvarDadosBancarios();
+    }
+  }
+
   /**
-   * Salva o estacionamento (gravar ou alterar conforme id).
+   * Salva o Estacionamento (gravar ou alterar conforme id).
    * @param stayOnPage se true, não navega para a lista; atualiza id/rota quando for criação (para Fotos usarem o id do backend).
    */
   onSubmit(stayOnPage = false): void {
+    this.salvarCadastroEstacionamento(stayOnPage);
+  }
+
+  /** Salvar do cabeçalho do layout (mesma lógica dos botões do rodapé por etapa). */
+  private executarSalvarDoCabecalho(): void {
+    if (this.loading) return;
+    if (this.currentStep === 1) {
+      this.onSubmit(true);
+    } else if (this.currentStep === 2) {
+      this.salvarDadosBancarios();
+    }
+  }
+
+  /**
+   * POST /api/Estacionamento (novo) ou PUT completo (edição), com merge do GET quando existir.
+   */
+  private salvarCadastroEstacionamento(stayOnPage = false): void {
+    if (this.salvando) return;
     if (this.form.invalid) {
       this.form.markAllAsTouched();
       if (stayOnPage) {
@@ -562,33 +855,188 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
       }
       return;
     }
+    const errosMinimosCriacao = this.validarCamposMinimosCriacao();
+    if (errosMinimosCriacao.length > 0) {
+      this.erro = 'Preencha os campos obrigatórios para criar o estacionamento.';
+      this.errosCamposSalvar = errosMinimosCriacao;
+      this.contatosOpen = true;
+      this.complementaresOpen = true;
+      this.toast.warning(errosMinimosCriacao[0]);
+      this.cdr.markForCheck();
+      return;
+    }
     this.salvando = true;
     this.erro = null;
+    this.errosCamposSalvar = [];
     // Fotos são gerenciadas apenas pelos endpoints BuscarFotos / UploadFotos / DeletarFotos (Azure); não enviamos no payload Gravar/Alterar.
-    const dto = formValueToEstacionamentoPayload(this.form.value, this.loadedEnderecos, []);
+    const raw = this.form.getRawValue() as FormValue;
+    const dto = formValueToEstacionamentoPayload(raw, this.loadedEnderecos, [], this.payloadMerge);
     const request$ = this.id
-        ? this.estacionamentoService.alterar(dto)
-        : this.estacionamentoService.gravar(dto);
-      request$.subscribe({
-        next: (res) => {
-          this.salvando = false;
-          if (stayOnPage) {
-            if (this.id == null && res?.id != null) {
-              this.id = res.id;
-              this.form.patchValue({ id: res.id }, { emitEvent: false });
-              this.router.navigate(['/app/cadastro/estacionamento', res.id], { replaceUrl: true });
-            }
-            this.toast.success(this.id ? 'Alterações salvas.' : 'Cadastro salvo.');
+      ? this.EstacionamentoService.alterar(dto)
+      : this.EstacionamentoService.gravar(dto);
+    request$.subscribe({
+      next: (res) => {
+        this.salvando = false;
+        const criacaoComSucesso = this.id == null && res?.id != null;
+        if (stayOnPage) {
+          if (criacaoComSucesso && res?.id != null) {
+            this.id = res.id;
+            this.form.patchValue({ id: res.id }, { emitEvent: false });
+            this.router.navigate(['/app/cadastro/estacionamento', res.id], { replaceUrl: true });
+            this.carregarEstacionamentoPorId();
+            this.toast.success('Cadastro salvo.');
           } else {
-            this.toast.success(this.id ? 'Estacionamento atualizado com sucesso.' : 'Estacionamento criado com sucesso.');
-            this.router.navigate(['/app/cadastro/estacionamento']);
+            const idAtual = this.id;
+            if (!idAtual) {
+              this.toast.success('Alterações salvas.');
+              return;
+            }
+            this.EstacionamentoService.obterPorIdDetalhado(idAtual).subscribe({
+              next: ({ dto: persisted }) => {
+                this.payloadMerge = persisted?.payloadMerge ?? null;
+                this.carregarEstacionamentoPorId();
+                if (!persisted) {
+                  this.toast.success('Alterações salvas.');
+                  return;
+                }
+                const divergencias = this.validarPersistenciaCadastro(raw, persisted);
+                if (divergencias.length > 0) {
+                  this.toast.warning(`Backend não persistiu: ${divergencias.join(', ')}.`);
+                  if (isDevMode()) {
+                    console.warn('[Estacionamento] Divergências após salvar cadastro', { divergencias, enviado: dto, retornado: persisted });
+                  }
+                } else {
+                  this.toast.success('Alterações salvas.');
+                }
+              },
+              error: () => {
+                this.toast.success('Alterações salvas.');
+              }
+            });
           }
-        },
-        error: () => {
-          this.erro = 'Erro ao salvar. Tente novamente.';
-          this.salvando = false;
+        } else {
+          this.toast.success(this.id ? 'Estacionamento atualizado com sucesso.' : 'Estacionamento criado com sucesso.');
+          this.router.navigate(['/app/cadastro/estacionamento']);
         }
-      });
+      },
+      error: (err: unknown) => {
+        const msg = this.extractApiMessage(err, 'Erro ao salvar. Tente novamente.');
+        const fieldErrors = this.extractApiFieldErrors(err);
+        this.erro = msg;
+        this.errosCamposSalvar = fieldErrors;
+        this.salvando = false;
+        this.toast.error(fieldErrors.length > 0 ? `${msg} ${fieldErrors[0]}` : msg);
+      }
+    });
+  }
+
+  private extractApiError(err: unknown): ApiError | null {
+    if (!err || typeof err !== 'object') return null;
+    if (!('message' in err)) return null;
+    return err as ApiError;
+  }
+
+  private extractApiMessage(err: unknown, fallback: string): string {
+    const api = this.extractApiError(err);
+    const msg = api?.message;
+    return typeof msg === 'string' && msg.trim() ? msg.trim() : fallback;
+  }
+
+  private extractApiFieldErrors(err: unknown): string[] {
+    const api = this.extractApiError(err);
+    const fieldErrors = api?.fieldErrors;
+    if (!fieldErrors) return [];
+    const out: string[] = [];
+    for (const [field, msgs] of Object.entries(fieldErrors)) {
+      for (const m of msgs ?? []) {
+        const text = String(m ?? '').trim();
+        if (!text) continue;
+        out.push(`${field}: ${text}`);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Compara campos-chave enviados no cadastro com o retorno do GET pós-salvar.
+   * Se houver divergência, muito provável que o backend não tenha persistido.
+   */
+  private validarPersistenciaCadastro(enviado: FormValue, retornado: EstacionamentoFormValue): string[] {
+    const diffs: string[] = [];
+    const trim = (v: unknown) => String(v ?? '').trim();
+    const onlyDigits = (v: unknown) => String(v ?? '').replace(/\D/g, '');
+
+    const envFantasia = trim(enviado.pessoa?.nomeFantasia);
+    const retFantasia = trim(retornado.pessoa?.nomeFantasia);
+    const retDescricao = trim(retornado.descricao);
+    // O backend pode refletir o nome fantasia em `descricao` (raiz) antes/atualizar sem espelhar em `pessoa.nomeFantasia`.
+    if (envFantasia !== retFantasia && envFantasia !== retDescricao) {
+      diffs.push('nome fantasia');
+    }
+    if (trim(enviado.pessoa?.nomeRazaoSocial) !== trim(retornado.pessoa?.nomeRazaoSocial)) {
+      diffs.push('razão social');
+    }
+    if (onlyDigits(enviado.pessoa?.cnpj) !== onlyDigits(retornado.pessoa?.cnpj)) {
+      diffs.push('cnpj');
+    }
+    if (Boolean(enviado.pessoa?.ativo) !== Boolean(retornado.pessoa?.ativo)) {
+      diffs.push('status');
+    }
+    if (trim(enviado.responsavelLegalNome) !== trim(retornado.responsavelLegalNome)) {
+      diffs.push('nome completo');
+    }
+    if (onlyDigits(enviado.responsavelLegalCpf) !== onlyDigits(retornado.responsavelLegalCpf)) {
+      diffs.push('cpf');
+    }
+    const envEmail = trim(enviado.responsavelLegalEmail).toLowerCase();
+    const retEmail = (trim(retornado.responsavelLegalEmail) || trim(retornado.pessoa?.email)).toLowerCase();
+    if (envEmail !== retEmail) {
+      diffs.push('email');
+    }
+    if (onlyDigits(enviado.contatoTelefone) !== onlyDigits(retornado.contatoTelefone)) {
+      diffs.push('telefone');
+    }
+    if (Number(enviado.capacidadeVeiculos ?? 0) !== Number(retornado.capacidadeVeiculos ?? 0)) {
+      diffs.push('capacidade');
+    }
+    if (trim(enviado.tamanho) !== trim(retornado.tamanho)) {
+      diffs.push('tamanho');
+    }
+    return diffs;
+  }
+
+  private validarCamposMinimosCriacao(): string[] {
+    if (this.id != null && this.id > 0) return [];
+    const erros: string[] = [];
+    const responsavelNome = String(this.form.get('responsavelLegalNome')?.value ?? '').trim();
+    const responsavelCpf = String(this.form.get('responsavelLegalCpf')?.value ?? '')
+      .replace(/\D/g, '')
+      .trim();
+    const responsavelEmail = String(this.form.get('responsavelLegalEmail')?.value ?? '').trim();
+    const responsavelTel = String(this.form.get('contatoTelefone')?.value ?? '').replace(/\D/g, '').trim();
+    if (!responsavelNome) erros.push('Nome completo do responsável é obrigatório.');
+    if (!responsavelCpf) erros.push('CPF do responsável é obrigatório.');
+    if (!responsavelEmail) erros.push('E-mail do responsável é obrigatório.');
+    if (responsavelTel.length < 10) erros.push('Telefone do responsável é obrigatório (mín. 10 dígitos).');
+
+    if (this.enderecosArray.length === 0) {
+      erros.push('Adicione ao menos um endereço principal.');
+      return erros;
+    }
+
+    const principal =
+      (this.enderecosArray.controls.find(
+        (ctrl) => Boolean((ctrl as FormGroup).get('principal')?.value)
+      ) as FormGroup | undefined) ?? (this.enderecosArray.at(0) as FormGroup);
+
+    const getValue = (key: string) => String(principal.get(key)?.value ?? '').trim();
+    if (!getValue('cep')) erros.push('CEP do endereço principal é obrigatório.');
+    if (!getValue('logradouro')) erros.push('Logradouro do endereço principal é obrigatório.');
+    if (!getValue('numero')) erros.push('Número do endereço principal é obrigatório.');
+    if (!getValue('bairro')) erros.push('Bairro do endereço principal é obrigatório.');
+    if (!getValue('cidade')) erros.push('Cidade do endereço principal é obrigatória.');
+    if (!getValue('estado')) erros.push('Estado do endereço principal é obrigatório.');
+    return erros;
   }
 
   /**
@@ -1072,10 +1520,10 @@ export class EstacionamentoFormComponent implements OnInit, OnDestroy {
     this.contratoPdfError = null;
   }
 
-  get documentoErrorMessage(): string | null {
-    const errors = this.form.get('pessoa.documento')?.errors;
+  get cnpjErrorMessage(): string | null {
+    const errors = this.form.get('pessoa.cnpj')?.errors;
     if (!errors) return null;
-    if (errors['required']) return 'Documento é obrigatório.';
+    if (errors['required']) return 'CNPJ é obrigatório.';
     const doc = errors['documento'];
     return doc && typeof doc === 'object' && 'message' in doc ? String(doc.message) : null;
   }

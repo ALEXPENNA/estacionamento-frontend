@@ -1,4 +1,4 @@
-import { MENU_STRUCTURE } from '../../cadastro/constants/menu-structure';
+import { MENU_STRUCTURE, type MenuSubItem } from '../../cadastro/constants/menu-structure';
 
 function norm(s: string): string {
   return s
@@ -15,9 +15,15 @@ function norm(s: string): string {
 const ALIAS_NOME_PARA_ROTA: Record<string, string> = {
   dashbord: '/app/dashboard',
   dashboard: '/app/dashboard',
-  movimentos: '/app/movimentos',
+  movimentos: '/app/movimentos/entrada-saida',
+  'entrada e saida': '/app/movimentos/entrada-saida',
+  entradaesaida: '/app/movimentos/entrada-saida',
+  /** API costuma mandar singular; rota real do SPA é plural */
+  movimento: '/app/movimentos/entrada-saida',
+  relatorio: '/app/relatorios',
   relatorios: '/app/relatorios',
-  financeiro: '/app/financeiro',
+  financeiro: '/app/financeiro/faturamento',
+  faturamento: '/app/financeiro/faturamento',
   configuracoes: '/app/configuracoes',
   configuracao: '/app/configuracoes',
   cadastros: '/app/cadastro',
@@ -26,46 +32,71 @@ const ALIAS_NOME_PARA_ROTA: Record<string, string> = {
   transportadora: '/app/cadastro/transportadora',
   estacionamento: '/app/cadastro/estacionamento',
   motorista: '/app/cadastro/motorista',
+  usuarios: '/app/configuracoes/usuarios',
   /** Submódulo "menu" na API ≈ aba Menu em Gerenciamento */
   menu: '/app/gerenciamento/menu',
-  acessos: '/app/gerenciamento',
+  /** Alias legado / API — gestão de usuários em Configurações */
+  acessos: '/app/configuracoes/usuarios',
   admin: '/app/gerenciamento/menu',
   perfil: '/app/gerenciamento/perfil',
 };
 
 const ALIAS_PATH_PARA_ROTA: Record<string, string> = {
-  '/app/movimento': '/app/movimentos',
+  '/app/movimento': '/app/movimentos/entrada-saida',
+  '/app/movimentos': '/app/movimentos/entrada-saida',
+  '/app/movimentos/operacao': '/app/movimentos/entrada-saida',
   '/app/relatorio': '/app/relatorios',
   '/app/gerenciamento': '/app/gerenciamento',
+  '/app/financeiro': '/app/financeiro/faturamento',
 };
+
+function matchSubItems(nomeNorm: string, subs: MenuSubItem[] | undefined): string | null {
+  if (!subs?.length) return null;
+  for (const c of subs) {
+    if (norm(c.label) === nomeNorm) return c.route;
+    const nested = matchSubItems(nomeNorm, c.children);
+    if (nested) return nested;
+  }
+  return null;
+}
 
 function tryMatchMenuStructure(nome: string): string | null {
   const key = norm(nome);
   for (const node of MENU_STRUCTURE) {
     if (norm(node.label) === key) return node.route;
-    if (node.children?.length) {
-      for (const c of node.children) {
-        if (norm(c.label) === key) return c.route;
-      }
-    }
+    const fromSubs = matchSubItems(key, node.children);
+    if (fromSubs) return fromSubs;
   }
   return null;
 }
 
 function normalizeApiRota(raw: string | null | undefined): string | null {
   if (raw == null) return null;
-  const t = String(raw).trim();
-  if (!t || t === '/app') return null;
-  if (t.startsWith('/app/')) {
-    return ALIAS_PATH_PARA_ROTA[t] ?? t;
+  let t = String(raw).trim();
+  if (!t || t === '/app' || t === '/app/') return null;
+
+  /**
+   * API costuma enviar `app/{menu}/...` sem barra inicial.
+   * Deve virar `/app/...` — nunca `/app/app/...` (bug do antigo `\/app${t}` quando t já começava com `app/`).
+   */
+  if (!t.startsWith('/')) {
+    if (/^app\//i.test(t)) {
+      t = `/${t}`;
+    } else {
+      t = `/app/${t.replace(/^\/+/, '')}`;
+    }
   }
-  if (t === '/app') return null;
-  if (t.startsWith('/')) {
-    const route = t.startsWith('/app') ? t : `/app${t}`;
-    return ALIAS_PATH_PARA_ROTA[route] ?? route;
+
+  const tl = t.toLowerCase();
+  if (tl === '/app') return null;
+
+  if (tl.startsWith('/app/')) {
+    return ALIAS_PATH_PARA_ROTA[tl] ?? t;
   }
-  const route = `/app/${t.replace(/^\//, '')}`;
-  return ALIAS_PATH_PARA_ROTA[route] ?? route;
+
+  const route = `/app${t}`.replace(/\/{2,}/g, '/');
+  const routeL = route.toLowerCase();
+  return ALIAS_PATH_PARA_ROTA[routeL] ?? route;
 }
 
 /**
@@ -141,3 +172,4 @@ export function resolveMaterialSymbolIconFromModule(
 
   return 'menu';
 }
+

@@ -4,10 +4,14 @@
  */
 export const environment = {
   production: true,
-  /** Base do backend (sem /api no final). */
-  apiUrl: 'https://localhost:44317',
-  /** Base URL da API (uso em TransportadoraService, ApiService e interceptors). */
-  API_BASE_URL: 'https://localhost:44317/api',
+  /** Base do backend (sem /api no final). Ajuste para o host público da API em produção. */
+  apiUrl: 'http://108.174.145.123:5000',
+  /** Base URL da API (uso em serviços HTTP e interceptors). */
+  API_BASE_URL: 'http://108.174.145.123:5000/api',
+  dashboardHubUrl: 'http://108.174.145.123:8081/hubs/movimento/entradasaida/dashboard',
+  movimentacoesAtualizadasUrl:
+    'http://108.174.145.123:8081/api/movimento/redis/movimentacoes-atualizadas',
+  
   emergencyAdmin: {
     enabled: false,
     username: '',

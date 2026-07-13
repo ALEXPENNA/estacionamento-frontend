@@ -32,7 +32,7 @@ import {
   type TreeMenuNode,
 } from './perfil-permissoes-tree.util';
 
-type ModalKind = 'create' | 'edit' | 'delete' | null;
+type ModalKind = 'create' | 'edit' | 'delete' | 'view' | null;
 
 const AVISO_SEM_ENDPOINT =
   'Backend não possui endpoints de perfis (roles) ainda.';
@@ -57,9 +57,17 @@ export class AcessosPerfisPageComponent implements OnInit {
   erro: string | null = null;
   itens: ApplicationRole[] = [];
 
+  /** Filtros (somente UI; lista já carregada). Ordem fixa: nome A-Z. */
+  /** Texto digitado no campo (ainda não aplicado até clicar na lupa ou Enter). */
+  searchDraft = '';
+  /** Termo efetivo da busca (usado em `perfisFiltrados`). */
+  searchTerm = '';
+  statusFilter: 'all' | 'ativo' | 'inativo' = 'all';
+
   modalKind = signal<ModalKind>(null);
   editItem = signal<ApplicationRole | null>(null);
   deleteItem = signal<ApplicationRole | null>(null);
+  viewItem = signal<ApplicationRole | null>(null);
   saving = signal(false);
   saveError = signal<string | null>(null);
   deleting = signal(false);
@@ -80,6 +88,7 @@ export class AcessosPerfisPageComponent implements OnInit {
   isCreate = computed(() => this.modalKind() === 'create');
   isEdit = computed(() => this.modalKind() === 'edit');
   isDelete = computed(() => this.modalKind() === 'delete');
+  isView = computed(() => this.modalKind() === 'view');
 
   ngOnInit(): void {
     this.carregar();
@@ -95,6 +104,8 @@ export class AcessosPerfisPageComponent implements OnInit {
         this.loading = false;
         this.erro = null;
         this.itens = rawList.map((item) => this.normalizeRoleItem(item));
+        this.searchDraft = '';
+        this.searchTerm = '';
         const menus = this.buildMenuCatalogFromProfiles(rawList);
         this.backendMenuCatalog.set(menus);
         this.permissionTree.set(buildPermissionTreeState(menus, null, []));
@@ -112,6 +123,18 @@ export class AcessosPerfisPageComponent implements OnInit {
 
   retry(): void {
     this.carregar();
+  }
+
+  /** Aplica o texto do campo à lista (sem nova chamada HTTP). */
+  aplicarBuscaPerfil(): void {
+    this.searchTerm = this.searchDraft.trim();
+    this.cdr.markForCheck();
+  }
+
+  limparBuscaPerfil(): void {
+    this.searchDraft = '';
+    this.searchTerm = '';
+    this.cdr.markForCheck();
   }
 
   private buildMenuCatalogFromProfiles(items: Record<string, unknown>[]): MenuAdmin[] {
@@ -277,7 +300,121 @@ export class AcessosPerfisPageComponent implements OnInit {
       concurrencyStamp: this.readString(raw, 'concurrencyStamp'),
       menus,
       permissionIds,
+      ativo: this.readProfileAtivoFlag(raw),
+      usuariosVinculados: this.readOptionalUserCount(raw),
+      ultimaAtualizacao: this.readOptionalDateString(raw),
     };
+  }
+
+  /** Lista aplicando busca e status (sem nova chamada HTTP). Ordem: nome A-Z. */
+  get perfisFiltrados(): ApplicationRole[] {
+    let list = [...this.itens];
+    const q = this.searchTerm.trim().toLowerCase();
+    if (q) {
+      list = list.filter((item) => {
+        const nome = (item.name ?? item.nome ?? '').toLowerCase();
+        const desc = (item.normalizedName ?? '').toLowerCase();
+        return nome.includes(q) || desc.includes(q);
+      });
+    }
+    if (this.statusFilter === 'ativo') {
+      list = list.filter((item) => this.isPerfilAtivoUi(item));
+    } else if (this.statusFilter === 'inativo') {
+      list = list.filter((item) => !this.isPerfilAtivoUi(item));
+    }
+
+    list.sort((a, b) => {
+      const na = (a.name ?? a.nome ?? '').toLocaleLowerCase('pt-BR');
+      const nb = (b.name ?? b.nome ?? '').toLocaleLowerCase('pt-BR');
+      return na.localeCompare(nb, 'pt-BR');
+    });
+
+    return list;
+  }
+
+  isPerfilAtivoUi(item: ApplicationRole): boolean {
+    if (item.ativo === false) return false;
+    if (item.ativo === true) return true;
+    return true;
+  }
+
+  formatUltimaAtualizacao(iso: string | null | undefined): string {
+    if (!iso?.trim()) return '—';
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return iso.trim();
+    return new Intl.DateTimeFormat('pt-BR', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(t));
+  }
+
+  formatUsuariosVinculados(item: ApplicationRole): string {
+    const n = item.usuariosVinculados;
+    if (n == null || Number.isNaN(n)) return '—';
+    return String(n);
+  }
+
+  perfilDisplayName(item: ApplicationRole): string {
+    return (item.name ?? item.nome ?? item.perfil ?? '—').trim() || '—';
+  }
+
+  openVisualizar(item: ApplicationRole): void {
+    this.viewItem.set(item);
+    this.modalKind.set('view');
+    this.cdr.markForCheck();
+  }
+
+  openDuplicar(item: ApplicationRole): void {
+    this.saveError.set(null);
+    this.editItem.set(null);
+    const base = this.perfilDisplayName(item);
+    const suffix = base !== '—' ? `${base} (cópia)` : 'Perfil (cópia)';
+    this.form = {
+      name: suffix,
+      normalizedName: item.normalizedName ?? '',
+      permissionIds: [...(item.permissionIds ?? [])],
+    };
+    this.permissionTree.set(
+      buildPermissionTreeState(this.backendMenuCatalog(), item.menus ?? null, item.permissionIds ?? [])
+    );
+    this.modalKind.set('create');
+    this.cdr.markForCheck();
+  }
+
+  private readProfileAtivoFlag(raw: Record<string, unknown>): boolean | undefined {
+    if (raw['inativo'] === true || raw['Inativo'] === true) return false;
+    if (raw['ativo'] === false || raw['Ativo'] === false) return false;
+    if (raw['ativo'] === true || raw['Ativo'] === true) return true;
+    return undefined;
+  }
+
+  private readOptionalUserCount(raw: Record<string, unknown>): number | null | undefined {
+    const n = this.readNumber(
+      raw,
+      'usuariosVinculados',
+      'qtdUsuarios',
+      'totalUsuarios',
+      'usuariosCount',
+      'qtdeUsuarios'
+    );
+    if (n != null && n >= 0) return n;
+    return undefined;
+  }
+
+  private readOptionalDateString(raw: Record<string, unknown>): string | null | undefined {
+    const s = this.readString(
+      raw,
+      'dataAtualizacao',
+      'ultimaAtualizacao',
+      'dataAlteracao',
+      'updatedAt',
+      'ultimaAlteracao',
+      'DataAtualizacao'
+    );
+    return s ?? undefined;
   }
 
   private extractPermissionIdsFromRole(raw: Record<string, unknown>): string[] {
@@ -596,6 +733,15 @@ export class AcessosPerfisPageComponent implements OnInit {
     return item.permissionIds?.length ?? 0;
   }
 
+  trackPerfil(item: ApplicationRole): string {
+    const id = item.id ?? item.perfilId;
+    if (id != null && `${id}`.length > 0) {
+      return `perfil:${id}`;
+    }
+    const nome = `${item.name ?? ''}::${item.nome ?? ''}`;
+    return `perfil-name:${nome}`;
+  }
+
   openExcluir(item: ApplicationRole): void {
     this.deleteItem.set(item);
     this.modalKind.set('delete');
@@ -606,6 +752,7 @@ export class AcessosPerfisPageComponent implements OnInit {
     this.modalKind.set(null);
     this.editItem.set(null);
     this.deleteItem.set(null);
+    this.viewItem.set(null);
     this.saveError.set(null);
     this.cdr.markForCheck();
   }

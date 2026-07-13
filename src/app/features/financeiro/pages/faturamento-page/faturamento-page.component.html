@@ -1,0 +1,31 @@
+<div class="faturamento-shell">
+  <div class="page-container">
+
+    <header class="page-header page-header-card fat-page-header">
+      <div class="fat-page-header__top">
+        <div class="fat-page-header__titles">
+          <h1 class="page-title">Faturamento</h1>
+          <p class="page-subtitle">Controle de faturas, cobranças e recebimentos</p>
+        </div>
+      </div>
+      <nav class="fat-fin-tabs" role="tablist" aria-label="Abas de Faturamento">
+        @for (t of tabs; track t.path) {
+          <a
+            class="fat-fin-tabs__tab"
+            role="tab"
+            [routerLink]="t.path"
+            routerLinkActive="tab--active"
+            [routerLinkActiveOptions]="{ exact: false }"
+          >
+            {{ t.label }}
+          </a>
+        }
+      </nav>
+    </header>
+
+    <div class="fat-fin-tab-body">
+      <router-outlet />
+    </div>
+
+  </div>
+</div>

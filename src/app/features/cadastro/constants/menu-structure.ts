@@ -6,6 +6,7 @@ export interface MenuSubItem {
   id: string;
   label: string;
   route: string;
+  children?: MenuSubItem[];
 }
 
 export interface MenuNode {
@@ -16,12 +17,18 @@ export interface MenuNode {
   children?: MenuSubItem[];
 }
 
-/** Estrutura completa do menu (espelha a sidebar). */
+/** Estrutura completa do menu (seed admin / permissões). A sidebar omite Estacionamento — acesso via `/app/gerenciamento`. */
 export const MENU_STRUCTURE: MenuNode[] = [
   { id: 'menu-dashboard', label: 'Dashboard', route: '/app/dashboard', icon: 'dashboard' },
-  { id: 'menu-movimentos', label: 'Movimentos', route: '/app/movimentos', icon: 'swap_horiz' },
+  { id: 'menu-movimentos', label: 'Entrada e Saída', route: '/app/movimentos/entrada-saida', icon: 'swap_horiz' },
   { id: 'menu-relatorios', label: 'Relatórios', route: '/app/relatorios', icon: 'assessment' },
-  { id: 'menu-financeiro', label: 'Financeiro', route: '/app/financeiro', icon: 'payments' },
+  {
+    id: 'menu-financeiro',
+    label: 'Financeiro',
+    route: '/app/financeiro',
+    icon: 'payments',
+    children: [{ id: 'sub-faturamento', label: 'Faturamento', route: '/app/financeiro/faturamento' }],
+  },
   {
     id: 'menu-configuracoes',
     label: 'Configurações',
@@ -37,7 +44,6 @@ export const MENU_STRUCTURE: MenuNode[] = [
     route: '/app/gerenciamento',
     icon: 'admin_panel_settings',
     children: [
-      { id: 'sub-acessos', label: 'Acessos', route: '/app/gerenciamento' },
       { id: 'sub-menu', label: 'Menu', route: '/app/gerenciamento/menu' },
       { id: 'sub-perfil', label: 'Perfil', route: '/app/gerenciamento/perfil' },
     ],
@@ -47,21 +53,25 @@ export const MENU_STRUCTURE: MenuNode[] = [
     label: 'Cadastro',
     route: '/app/cadastro',
     icon: 'playlist_add',
-    children: [
-      { id: 'sub-estacionamento', label: 'Estacionamento', route: '/app/cadastro/estacionamento' },
-      { id: 'sub-transportadora', label: 'Transportadora', route: '/app/cadastro/transportadora' },
-    ],
+    children: [{ id: 'sub-transportadora', label: 'Transportadora', route: '/app/cadastro/transportadora' }],
   },
 ];
+
+function collectSubMenuIds(subs: MenuSubItem[], ids: string[]): void {
+  for (const sub of subs) {
+    ids.push(sub.id);
+    if (sub.children?.length) {
+      collectSubMenuIds(sub.children, ids);
+    }
+  }
+}
 
 /** Todos os nós (menu ou submenu) que podem ter permissões vinculadas. */
 export function getAllMenuNodeIds(): string[] {
   const ids: string[] = [];
   for (const node of MENU_STRUCTURE) {
     if (node.children?.length) {
-      for (const sub of node.children) {
-        ids.push(sub.id);
-      }
+      collectSubMenuIds(node.children, ids);
     } else {
       ids.push(node.id);
     }

@@ -12,12 +12,18 @@ export interface ApplicationRole {
   perfilId?: number | string;
   perfil?: string | null;
   name?: string | null;
-  nome?: string | null; 
+  nome?: string | null;
   normalizedName?: string | null;
   concurrencyStamp?: string | null;
   rolePermissions?: unknown[] | null;
   menus?: unknown[] | null;
   permissionIds?: string[];
+  /** Quando ausente na API, a UI assume ativo para filtros/badge. */
+  ativo?: boolean;
+  /** Quantidade de usuários vinculados (quando o backend enviar). */
+  usuariosVinculados?: number | null;
+  /** ISO ou string retornada pela API para última atualização. */
+  ultimaAtualizacao?: string | null;
 }
 
 export interface PerfilPermissaoInput {
@@ -62,7 +68,10 @@ export interface PerfilBuscarParams {
  * GET /api/auth/Perfil/{id}
  * DELETE /api/auth/Perfil/{id}
  * GET /api/auth/Perfil/usuario/{usuarioId}
- * @see https://localhost:44317/swagger/v1/swagger.json (tag Perfil)
+
+ * GET /api/auth/Perfil/usuario/buscarSimplicado
+
+ * @see http://108.174.145.123:5000/swagger/v1/swagger.json (tag Perfil)
  */
 @Injectable({
   providedIn: 'root'
@@ -105,5 +114,10 @@ export class AcessosPerfisService {
   /** GET /api/auth/Perfil/usuario/{usuarioId} */
   buscarPorUsuario(usuarioId: string | number): Observable<unknown> {
     return this.http.get<unknown>(`${AUTH_PERFIL}/usuario/${usuarioId}`).pipe(timeout(15000));
+  }
+
+  /** GET /api/auth/Perfil/usuario/buscarSimplicado */
+  buscarSimplicadoUsuario(): Observable<unknown> {
+    return this.http.get<unknown>(`${AUTH_PERFIL}/usuario/buscarSimplicado`).pipe(timeout(15000));
   }
 }

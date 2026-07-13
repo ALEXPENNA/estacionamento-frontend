@@ -62,7 +62,17 @@ export class SessionAccessService {
     if (current === '/app' || current === '') {
       return true;
     }
-    return allowed.some((route) => isRouteMatch(current, route));
+    if (allowed.some((route) => isRouteMatch(current, route))) {
+      return true;
+    }
+    /** Lista em Gerenciamento espelha o mesmo acesso da rota canônica em Cadastro. */
+    if (current === '/app/gerenciamento/estacionamento') {
+      return allowed.some((route) => {
+        const r = normalizeRoute(route);
+        return r === '/app/cadastro/estacionamento' || r.startsWith('/app/cadastro/estacionamento/');
+      });
+    }
+    return false;
   }
 
   getDefaultRoute(): string | null {
@@ -70,7 +80,16 @@ export class SessionAccessService {
     return allowed[0] ?? null;
   }
 
-  filterSidebarItems<T extends { route: string; children?: { route: string }[] }>(items: T[]): T[] {
+  /**
+   * Filtra itens da sidebar pelas rotas permitidas na sessão.
+   * Suporta um nível extra de filhos (ex.: Motorista sob Transportadora).
+   */
+  filterSidebarItems<
+    T extends {
+      route: string;
+      children?: { route: string; label?: string; children?: { route: string }[] }[];
+    },
+  >(items: T[]): T[] {
     if (!this.hasSessionMenus()) {
       return items;
     }
@@ -84,7 +103,18 @@ export class SessionAccessService {
     return items
       .map((item) => {
         if (item.children?.length) {
-          const children = item.children.filter((child) => hasRoute(child.route));
+          const children = item.children
+            .map((child) => {
+              if (child.children?.length) {
+                const nestedVisible = child.children.filter((n) => hasRoute(n.route));
+                if (nestedVisible.length > 0) {
+                  return { ...child, children: nestedVisible };
+                }
+              }
+              return hasRoute(child.route) ? child : null;
+            })
+            .filter((child): child is NonNullable<typeof child> => child !== null);
+
           if (children.length === 0 && !hasRoute(item.route)) {
             return null;
           }

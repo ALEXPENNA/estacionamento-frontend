@@ -11,7 +11,7 @@ export interface DadosVeiculoCadastro {
   quantidadeEixos: string;
 }
 
-/** Lookup por placa reaproveitando endpoints já existentes (Veiculo/Buscar + Transportadora/ObterPorId). */
+/** Lookup por placa: GET /api/Veiculo?... e GET /api/Transportadora/{id}. */
 @Injectable({ providedIn: 'root' })
 export class PlacaTransportadoraLookupService {
   private readonly veiculoService = inject(VeiculoService);
@@ -58,7 +58,7 @@ export class PlacaTransportadoraLookupService {
                 } satisfies DadosVeiculoCadastro);
               }
 
-              return this.transportadoraService.obterPorId(transportadoraId).pipe(
+              return this.transportadoraService.obterTransportadoraPorId(transportadoraId).pipe(
                 map((t) => ({
                   transportadora:
                     t?.nomeFantasia?.trim() || t?.razaoSocial?.trim() || '—',
